@@ -95,6 +95,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
 
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
+    MMVQ_PARAMETERS_MAXWELL,
     MMVQ_PARAMETERS_TURING,
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
@@ -114,6 +115,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_GCN;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
     return MMVQ_PARAMETERS_TURING;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 500 && __CUDA_ARCH__ < GGML_CUDA_CC_PASCAL
+    return MMVQ_PARAMETERS_MAXWELL;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     return MMVQ_PARAMETERS_GB10;
 #else
@@ -136,6 +139,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return MMVQ_PARAMETERS_TURING;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= 500 && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_PASCAL) {
+        return MMVQ_PARAMETERS_MAXWELL;
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
         return MMVQ_PARAMETERS_GB10;
@@ -455,7 +461,30 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #endif
 }
 
+// nwarps for the decode (ncols_dst=1) generic kernel on Maxwell, overridable for benchmarking.
+#ifndef GGML_MMVQ_NWARPS_MAXWELL_N1
+#define GGML_MMVQ_NWARPS_MAXWELL_N1 1
+#endif
+
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+    if (table_id == MMVQ_PARAMETERS_MAXWELL) {
+        if (ncols_dst == 1) {
+            return GGML_MMVQ_NWARPS_MAXWELL_N1;
+        }
+        switch (ncols_dst) {
+            case 2:
+            case 3:
+            case 4:
+                return 4;
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 2;
+            default:
+                return 1;
+        }
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
