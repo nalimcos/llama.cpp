@@ -466,6 +466,11 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #define GGML_MMVQ_NWARPS_MAXWELL_N1 1
 #endif
 
+// nwarps for the decode (ncols_dst=1) generic kernel on Maxwell for complex-vec_dot IQ types.
+#ifndef GGML_MMVQ_NWARPS_MAXWELL_N1_IQ
+#define GGML_MMVQ_NWARPS_MAXWELL_N1_IQ 2
+#endif
+
 // rows_per_block for the decode (ncols_dst=1) generic kernel on Maxwell, overridable for benchmarking.
 #ifndef GGML_MMVQ_RPB_MAXWELL_N1
 #define GGML_MMVQ_RPB_MAXWELL_N1 4
@@ -474,7 +479,19 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_MAXWELL) {
         if (ncols_dst == 1) {
-            return GGML_MMVQ_NWARPS_MAXWELL_N1;
+            // Types with complex lookup-based vec_dot (IQ2/IQ3) are compute-bound on the
+            // scalar Maxwell path and benefit from more warps per row. IQ1/IQ4 are faster
+            // and stay at 1 warp like the K-quants.
+            switch (type) {
+                case GGML_TYPE_IQ2_XXS:
+                case GGML_TYPE_IQ2_XS:
+                case GGML_TYPE_IQ2_S:
+                case GGML_TYPE_IQ3_XXS:
+                case GGML_TYPE_IQ3_S:
+                    return GGML_MMVQ_NWARPS_MAXWELL_N1_IQ;
+                default:
+                    return GGML_MMVQ_NWARPS_MAXWELL_N1;
+            }
         }
         switch (ncols_dst) {
             case 2:
