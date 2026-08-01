@@ -162,14 +162,14 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
         case GGML_TYPE_NVFP4:   return 4;
         case GGML_TYPE_Q2_K:    return 4;
         case GGML_TYPE_Q3_K:    return 4;
-        case GGML_TYPE_Q4_0:    return 6;
+        case GGML_TYPE_Q4_0:    return 8;
         case GGML_TYPE_Q4_1:    return 6;
-        case GGML_TYPE_Q4_K:    return 5;
+        case GGML_TYPE_Q4_K:    return 8;
         case GGML_TYPE_Q5_0:    return 6;
         case GGML_TYPE_Q5_1:    return 6;
         case GGML_TYPE_Q5_K:    return 5;
         case GGML_TYPE_Q6_K:    return 4;
-        case GGML_TYPE_Q8_0:    return 4;
+        case GGML_TYPE_Q8_0:    return 8;
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
 }
@@ -426,6 +426,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
+
+// rows_per_block for the MoE kernel (mul_mat_vec_q_moe) on Maxwell (cc 5.x).
+// 2 was tuned on newer archs; overridable here for benchmarking.
+#ifndef GGML_MMVQ_MOE_RPB_MAXWELL
+#define GGML_MMVQ_MOE_RPB_MAXWELL 8
+#endif
 
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
 template <ggml_type type>
@@ -1048,28 +1054,37 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t ncols_dst, const uint32_t ids_stride,
         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
 
-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
-    const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
-    const dim3 block_nums(nblocks_rows, nchannels_dst);
-    const dim3 block_dims(warp_size, ncols_dst);
-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    // 2 gives best perf based on tuning on newer archs; Maxwell uses GGML_MMVQ_MOE_RPB_MAXWELL.
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool maxwell = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 500 && cc < GGML_CUDA_CC_PASCAL;
 
+    const dim3 block_dims(warp_size, ncols_dst);
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
 
-    if (has_fusion) {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
+    if (maxwell && GGML_MMVQ_MOE_RPB_MAXWELL != 2) {
+        constexpr int rows_per_block = GGML_MMVQ_MOE_RPB_MAXWELL;
+        const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
+        const dim3 block_nums(nblocks_rows, nchannels_dst);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, has_fusion>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
             ncols_dst, ids_stride);
-    } else {
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
-            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
-            stride_row_x, stride_col_y, stride_col_dst,
-            stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride);
+        return;
     }
+
+    constexpr int rows_per_block = 2;
+    const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
+    const dim3 block_nums(nblocks_rows, nchannels_dst);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+
+    ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, has_fusion>, launch_params,
+        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+        stride_row_x, stride_col_y, stride_col_dst,
+        stride_channel_x, stride_channel_y, stride_channel_dst,
+        ncols_dst, ids_stride);
 }
 
 template <ggml_type type>
