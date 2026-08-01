@@ -218,6 +218,56 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(USE_CUDA_GRAPH)
+// Probe whether stream capture + graph launch actually work on this device.
+// Some pre-Volta GPUs on legacy drivers fail at capture or launch; a failure
+// would otherwise surface as a fatal CUDA_CHECK during the first graphed compute.
+// On failure, clean up any partial objects and clear the sticky error so later
+// CUDA calls are not poisoned, then report unsupported (graphs stay disabled).
+static bool ggml_cuda_probe_graph_capture() {
+    bool ok = true;
+
+    cudaStream_t stream = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t instance = nullptr;
+
+    if (cudaStreamCreate(&stream) != cudaSuccess) {
+        ok = false;
+    }
+
+    if (ok && cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
+        ok = false;
+    }
+    if (ok && cudaStreamEndCapture(stream, &graph) != cudaSuccess) {
+        ok = false;
+    }
+    if (ok && cudaGraphInstantiate(&instance, graph, NULL, NULL, 0) != cudaSuccess) {
+        ok = false;
+    }
+    if (ok && cudaGraphLaunch(instance, stream) != cudaSuccess) {
+        ok = false;
+    }
+    if (ok && cudaStreamSynchronize(stream) != cudaSuccess) {
+        ok = false;
+    }
+
+    if (instance != nullptr) {
+        cudaGraphExecDestroy(instance);
+    }
+    if (graph != nullptr) {
+        cudaGraphDestroy(graph);
+    }
+    if (stream != nullptr) {
+        cudaStreamDestroy(stream);
+    }
+    if (!ok) {
+        cudaGetLastError(); // clear sticky error from the failed probe
+    }
+
+    return ok;
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(USE_CUDA_GRAPH)
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -356,6 +406,15 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
         CUDA_CHECK(cudaSetDevice(physical_id));
         CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+
+#ifdef USE_CUDA_GRAPH
+        if (info.devices[id].cc < GGML_CUDA_CC_VOLTA) {
+            info.devices[id].graph_capture_supported = ggml_cuda_probe_graph_capture();
+            if (!info.devices[id].graph_capture_supported) {
+                GGML_LOG_INFO("  Device %d: CUDA graph capture not supported, graphs disabled\n", id);
+            }
+        }
+#endif // USE_CUDA_GRAPH
 
         // Temporary performance fix:
         // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
@@ -4443,7 +4502,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+        if (!ggml_cuda_info().devices[cuda_ctx->device].graph_capture_supported) {
             if (!graph->disable_due_to_gpu_arch) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
             }
