@@ -1959,7 +1959,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t ne_get_rows = ne12 * n_expert_used;
 
     std::vector<int32_t> ids_to_sorted_host;
-    ids_to_sorted_host.reserve(2*ne_get_rows);
+    ids_to_sorted_host.reserve(2*ne_get_rows); // forward map + ids_from_sorted appended below
     std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
 
     ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
@@ -1973,21 +1973,40 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
-        for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
-            for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-                const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
-                if (expert_to_use == i02) {
-                    ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
-                    ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
-                    tokens_per_expert[i02]++;
-                    break;
-                }
+    // group token slots by expert; for duplicate ids within a token only the first iex is used
+    std::vector<int64_t> expert_seen(ne02, -1);
+    for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
+        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+            const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+            assert(expert_to_use >= 0 && expert_to_use < ne02);
+            if (expert_to_use >= 0 && expert_to_use < ne02 && expert_seen[expert_to_use] != i12) {
+                expert_seen[expert_to_use] = i12;
+                tokens_per_expert[expert_to_use]++;
             }
         }
     }
+
+    std::vector<int32_t> expert_cursor(ne02);
+    int32_t n_rows = 0;
+    for (int64_t i02 = 0; i02 < ne02; ++i02) {
+        expert_cursor[i02] = n_rows;
+        n_rows += tokens_per_expert[i02];
+    }
+    ids_to_sorted_host.resize(n_rows);
     GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+
+    std::fill(expert_seen.begin(), expert_seen.end(), -1);
+    for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
+        for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+            const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+            if (expert_to_use >= 0 && expert_to_use < ne02 && expert_seen[expert_to_use] != i12) {
+                expert_seen[expert_to_use] = i12;
+                const int32_t pos = expert_cursor[expert_to_use]++;
+                ids_from_sorted_host[i12*n_expert_used + iex] = pos;
+                ids_to_sorted_host[pos] = i12*ne11 + iex % ne11;
+            }
+        }
+    }
 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
