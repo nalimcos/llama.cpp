@@ -466,6 +466,11 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #define GGML_MMVQ_NWARPS_MAXWELL_N1 1
 #endif
 
+// rows_per_block for the decode (ncols_dst=1) generic kernel on Maxwell, overridable for benchmarking.
+#ifndef GGML_MMVQ_RPB_MAXWELL_N1
+#define GGML_MMVQ_RPB_MAXWELL_N1 4
+#endif
+
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_MAXWELL) {
         if (ncols_dst == 1) {
@@ -612,6 +617,13 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (table_id == MMVQ_PARAMETERS_MAXWELL) {
+        // rpb>1 gives each block more warps -> better SM occupancy at small channel counts
+        if (ncols_dst == 1) {
+            return small_k ? nwarps : GGML_MMVQ_RPB_MAXWELL_N1;
+        }
+        return 1;
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
