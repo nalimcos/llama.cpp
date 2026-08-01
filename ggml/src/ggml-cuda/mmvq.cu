@@ -174,7 +174,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
         case GGML_TYPE_Q5_0:    return 6;
         case GGML_TYPE_Q5_1:    return 6;
         case GGML_TYPE_Q5_K:    return 5;
-        case GGML_TYPE_Q6_K:    return 4;
+        case GGML_TYPE_Q6_K:    return 8;
         case GGML_TYPE_Q8_0:    return 8;
         default:                return MMVQ_MAX_BATCH_SIZE;
     }
