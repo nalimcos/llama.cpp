@@ -1952,6 +1952,13 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         }
     }
 
+    // cc 5.x (Maxwell): token-chunked fused MMVQ MoE path, no stream sync
+    if (ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4 &&
+            dst->ne[2] > MMVQ_MAX_BATCH_SIZE && dst->ne[2] <= MMVQ_MOE_CHUNK_MAX_BATCH && dst->ne[0] % QK8_1 == 0 &&
+            GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= 500 && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_PASCAL) {
+        return false;
+    }
+
     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
         return false;
     }
@@ -1991,6 +1998,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             }
+        }
+
+        // cc 5.x (Maxwell): no dp4a/MMQ/MMF. Route medium MoE batches to the fused MMVQ MoE kernel
+        // (token-chunked in ggml_cuda_mul_mat_vec_q) instead of the synchronizing fallback below.
+        if (ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4 &&
+                ne2 > MMVQ_MAX_BATCH_SIZE && ne2 <= MMVQ_MOE_CHUNK_MAX_BATCH && ne00 % QK8_1 == 0 &&
+                GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= 500 && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_PASCAL) {
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+            return;
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
