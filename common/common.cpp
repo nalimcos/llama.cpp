@@ -1502,6 +1502,12 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
 
+    // MTP draft graphs require hidden-state inputs that a token-only probe decode cannot
+    // provide; the draft context also has no memory module of its own. skip the probe.
+    if (llama_get_ctx_type(ctx) == LLAMA_CONTEXT_TYPE_MTP) {
+        return COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    }
+
     if (llama_n_rs_seq(ctx) > 0) {
         COM_TRC("%s", "the context supports bounded partial sequence removal\n");
         return COMMON_CONTEXT_SEQ_RM_TYPE_RS;
