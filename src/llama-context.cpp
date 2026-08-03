@@ -4008,6 +4008,14 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     return ctx->get_memory();
 }
 
+enum llama_context_type llama_get_ctx_type(const struct llama_context * ctx) {
+    if (!ctx) {
+        return LLAMA_CONTEXT_TYPE_DEFAULT;
+    }
+
+    return ctx->get_cparams().ctx_type;
+}
+
 float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 
