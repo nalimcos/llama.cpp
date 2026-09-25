@@ -266,6 +266,8 @@ static const char * split_mode_str(llama_split_mode mode) {
             return "row";
         case LLAMA_SPLIT_MODE_TENSOR:
             return "tensor";
+        case LLAMA_SPLIT_MODE_LAYER_TENSOR:
+            return "layer-tensor";
         default:
             GGML_ABORT("invalid split mode");
     }
@@ -360,6 +362,7 @@ struct cmd_params {
     std::vector<llama_flash_attn_type> flash_attn;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
+    std::vector<int>                 tensor_group_size;
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
@@ -405,6 +408,7 @@ static const cmd_params cmd_params_defaults = {
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
+    /* tensor_group_size    */ { 0 },
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
@@ -470,7 +474,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
-    printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
+    printf("  -sm, --split-mode <none|layer|row|tensor|layer-tensor> (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
+    printf("  -tgs, --tensor-group-size <n>                     (default: %s)\n", join(cmd_params_defaults.tensor_group_size, ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
@@ -762,6 +767,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         mode = LLAMA_SPLIT_MODE_ROW;
                     } else if (m == "tensor") {
                         mode = LLAMA_SPLIT_MODE_TENSOR;
+                    } else if (m == "layer-tensor") {
+                        mode = LLAMA_SPLIT_MODE_LAYER_TENSOR;
                     } else {
                         invalid_param = true;
                         break;
@@ -928,6 +935,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     }
                     params.tensor_split.push_back(tensor_split);
                 }
+            } else if (arg == "-tgs" || arg == "--tensor-group-size") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.tensor_group_size = parse_int_range(argv[i]);
             } else if (arg == "-ot" || arg == "--override-tensor") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1161,6 +1174,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.tensor_split.empty()) {
         params.tensor_split = cmd_params_defaults.tensor_split;
     }
+    if (params.tensor_group_size.empty()) {
+        params.tensor_group_size = cmd_params_defaults.tensor_group_size;
+    }
     if (params.tensor_buft_overrides.empty()) {
         params.tensor_buft_overrides = cmd_params_defaults.tensor_buft_overrides;
     }
@@ -1218,6 +1234,7 @@ struct cmd_params_instance {
     llama_flash_attn_type flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
+    int                tensor_group_size;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool               embeddings;
     bool               no_op_offload;
@@ -1236,7 +1253,14 @@ struct cmd_params_instance {
         mparams.load_mode     = load_mode;
         mparams.lazy_mode     = lazy_mode;
         mparams.main_gpu      = main_gpu;
-        mparams.tensor_split  = tensor_split.data();
+        mparams.tensor_group_size = tensor_group_size;
+        if (split_mode == LLAMA_SPLIT_MODE_LAYER_TENSOR &&
+            std::all_of(tensor_split.begin(), tensor_split.end(), [](float v) { return v == 0.0f; })) {
+            // tensor_split is not supported with layer-tensor split; pass nullptr if it was not set
+            mparams.tensor_split = nullptr;
+        } else {
+            mparams.tensor_split = tensor_split.data();
+        }
         mparams.no_host       = no_host;
 
         if (n_cpu_moe <= 0) {
@@ -1283,6 +1307,7 @@ struct cmd_params_instance {
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
+               tensor_group_size == other.tensor_group_size &&
                devices == other.devices && no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
@@ -1321,6 +1346,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & mg : params.main_gpu)
     for (const auto & devs : params.devices)
     for (const auto & ts : params.tensor_split)
+    for (const auto & tgs : params.tensor_group_size)
     for (const auto & ot : params.tensor_buft_overrides)
     for (const auto & noh : params.no_host)
     for (const auto & embd : params.embeddings)
@@ -1363,6 +1389,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
+                /* .tensor_group_size     = */ tgs,
                 /* .tensor_buft_overrides = */ ot,
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
@@ -1400,6 +1427,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
+                /* .tensor_group_size     = */ tgs,
                 /* .tensor_buft_overrides = */ ot,
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
@@ -1437,6 +1465,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
+                /* .tensor_group_size     = */ tgs,
                 /* .tensor_buft_overrides = */ ot,
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,

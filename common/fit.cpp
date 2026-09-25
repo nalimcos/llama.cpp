@@ -180,8 +180,8 @@ static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
-    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
+    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR || mparams->split_mode == LLAMA_SPLIT_MODE_LAYER_TENSOR) {
+        throw common_params_fit_exception("llama_params_fit is not implemented for tensor split modes, abort");
     }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;

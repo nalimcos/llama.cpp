@@ -354,6 +354,14 @@ static ggml_cuda_device_info ggml_cuda_init() {
             turing_devices_without_mma.push_back({ id, device_name });
         }
 
+        CUDA_CHECK(cudaSetDevice(id));
+        // experimental: GGML_CUDA_SPIN_WAIT trades CPU for lower sync/wake latency
+        if (getenv("GGML_CUDA_SPIN_WAIT") != nullptr) {
+            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
+        } else {
+            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+        }
+
         // Temporary performance fix:
         // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
         // TODO: Check for future drivers the default scheduling strategy and
@@ -4423,10 +4431,19 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
     if (graph->graph == nullptr) {
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
-            if (!graph->disable_due_to_gpu_arch) {
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
+            static bool force_graphs = getenv("GGML_CUDA_GRAPHS_FORCE") != nullptr;
+            if (force_graphs) {
+                static bool warned_force = false;
+                if (!warned_force) {
+                    GGML_LOG_WARN("%s: GGML_CUDA_GRAPHS_FORCE is set, keeping CUDA graphs enabled on an unsupported GPU architecture (cc < Volta)\n", __func__);
+                    warned_force = true;
+                }
+            } else {
+                if (!graph->disable_due_to_gpu_arch) {
+                    GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
+                }
+                graph->disable_due_to_gpu_arch = true;
             }
-            graph->disable_due_to_gpu_arch = true;
         }
     }
 

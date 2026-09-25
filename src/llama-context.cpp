@@ -429,7 +429,8 @@ llama_context::llama_context(
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
-            model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
+            (model.split_mode() == LLAMA_SPLIT_MODE_LAYER ||
+             model.split_mode() == LLAMA_SPLIT_MODE_LAYER_TENSOR) &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
 
@@ -1279,10 +1280,10 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    if (sampler && (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR || model.split_mode() == LLAMA_SPLIT_MODE_LAYER_TENSOR)) {
         static bool warned = false;
         if (!warned) {
-            LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
+            LLAMA_LOG_WARN("%s: backend sampling not supported with tensor split; using CPU\n", __func__);
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {
@@ -3760,13 +3761,13 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
-    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR || model->split_mode() == LLAMA_SPLIT_MODE_LAYER_TENSOR) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
-            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for tensor split\n", __func__);
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         }
         if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
-            LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
+            LLAMA_LOG_ERROR("%s: tensor split requires flash_attn to be enabled\n", __func__);
             return nullptr;
         }
         if (model->get_split_state_ud.n_devices == 1) {
