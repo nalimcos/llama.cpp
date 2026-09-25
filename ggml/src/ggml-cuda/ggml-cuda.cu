@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/ar-wire.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -962,6 +963,138 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     return &ggml_backend_cuda_buffer_types[device];
 }
 
+// Persistent per-rank resources for the quantized ring all-reduce.  These
+// survive across all-reduce calls so the repeated per-call cudaHostAlloc /
+// cudaFreeHost and fresh pool allocations of the original implementation
+// disappear, and the transfers can run on dedicated non-blocking (copy-engine)
+// streams with parity double-buffered pinned host staging so consecutive steps
+// overlap.  Mirrors the copy-engine pipeline in allreduce.cu:
+//   * host[2] double-buffered by step parity (step%2) so consecutive steps use
+//     disjoint host slots and can overlap safely.
+//   * d2h_stream / h2d_stream are per-rank non-blocking transfer streams --
+//     the send-side D2H and the receive-side H2D run on separate streams so the
+//     two directions overlap (full-duplex PCIe); the add/quant and FWHT kernels
+//     stay on the compute stream (cuda_ctx->stream()).
+//   * d2h_ready[2][C]  -- owner staged sub-chunk c of its send chunk to
+//     host[parity]+c*sub_wire; consumed by the right neighbor via
+//     cudaStreamWaitEvent.
+//   * recv_h2d_done[2][C] -- consumer's H2D sub-chunks landed on device; gates
+//     the compute stream's add for that parity (waits on the last sub-chunk).
+//   * host_read_done -- consumer drained its neighbor's host slot; the owner
+//     waits on it before overwriting in a later step / later AR.  This is the
+//     ring analogue of allreduce.cu's host_large_read_done cross-AR fence.
+//   * comp_done[2] -- compute-stream add/quant for a parity done; gates the
+//     next use of qn_a/rot_acc for that parity.
+
+// Sub-chunks per ring step for bidirectional D2H||H2D pipelining.  Sweet spot
+// measured on 8x M10 (9B Q4_1, -sm tensor, pp256, q8 ring): C=2 72.78 >
+// C=4 68.84 > C=1 54.95, while C=8 regresses to 26.70 (per-sub launch
+// overhead at small sub-chunks), so default to 2.  Effective C is the largest
+// value in [1..GGML_CUDA_AR_RING_SUBCHUNKS_MAX] that divides the chunk exactly
+// and keeps each sub-chunk wire-block aligned (falls back to 1 = monolithic).
+static constexpr int GGML_CUDA_AR_RING_SUBCHUNKS     = 2; // default subdivision
+static constexpr int GGML_CUDA_AR_RING_SUBCHUNKS_MAX = 8; // upper bound (event-array capacity)
+
+// Effective per-step sub-chunk count from the environment
+// (GGML_CUDA_AR_RING_SUBCHUNKS, default 2, clamped to [1, MAX]).  A caller can
+// set 1 to force the old monolithic single-copy behavior for A/B testing.
+static inline int ggml_cuda_ar_ring_subchunks(void) {
+    const uint64_t v = ggml_cuda_ar_env_u64("GGML_CUDA_AR_RING_SUBCHUNKS", GGML_CUDA_AR_RING_SUBCHUNKS);
+    int c = (int) v;
+    if (c < 1) { c = 1; }
+    if (c > GGML_CUDA_AR_RING_SUBCHUNKS_MAX) { c = GGML_CUDA_AR_RING_SUBCHUNKS_MAX; }
+    return c;
+}
+
+// Early add/quantize each ring sub-chunk as soon as its H2D lands, instead of
+// waiting for the whole chunk.  Default ON (per-sub-chunk launch so earlier
+// sub-chunks compute while later ones are still arriving); setting
+// GGML_CUDA_AR_RING_EARLY_ADD to an explicit off-string ("0","false","no",
+// "off", case-insensitive) reverts to the monolithic single-kernel-pair per
+// chunk, the historical behavior.  Purely a caller-side A/B performance knob:
+// the ring algebra, FWHT placement and blockwise add are unchanged, so results
+// remain bit-identical across ranks.
+static inline bool ggml_cuda_ar_ring_early_add(void) {
+    const char * v = getenv("GGML_CUDA_AR_RING_EARLY_ADD");
+    if (v == nullptr) {
+        // Absent -> default ON.
+        return true;
+    }
+    for (const char * off : { "0", "false", "no", "off" }) {
+        // Case-insensitive match -> OFF.  Any other present value -> ON.
+        bool off_match = true;
+        for (const char *a = v, *b = off; ; ++a, ++b) {
+            const char ca = (char) std::tolower((unsigned char) *a);
+            if (ca != *b) { off_match = false; break; }
+            if (*b == '\0') break;
+        }
+        if (off_match) return false;
+    }
+    return true;
+}
+
+struct ggml_cuda_ar_ring_rank {
+    // Parity double-buffered pinned host staging.  Step s uses host[s%2]; two
+    // consecutive steps / two consecutive ARs use disjoint slots.
+    uint8_t *   host[2]        = { nullptr, nullptr };
+
+    // Split non-blocking transfer streams per rank: `d2h_stream` runs the
+    // send-side (D2H) staging, `h2d_stream` the receive-side (H2D) pulls.  A
+    // single stream's in-order rule serialized the two directions (D2H then
+    // H2D); two streams let them overlap on full-duplex PCIe.
+    cudaStream_t d2h_stream     = nullptr;   // send-side (D2H) non-blocking stream
+    cudaStream_t h2d_stream     = nullptr;   // receive-side (H2D) non-blocking stream
+
+    // Sender staged sub-chunk c of its send chunk for this parity to
+    // host[parity] + c*sub_wire; consumed by the right neighbor (rank r+1) via
+    // cudaStreamWaitEvent on its h2d_stream.  Per-parity so a step only ever
+    // waits on its own parity's record.  One event per sub-chunk so the pull
+    // side can wait on each sub-chunk independently as it lands.
+    cudaEvent_t d2h_ready[2][GGML_CUDA_AR_RING_SUBCHUNKS_MAX] = {};
+
+    // "Consumer's H2D sub-chunk c for this parity landed on device".  Gates the
+    // compute-stream add that reads the freshly-pulled qn_rx slot.  The compute
+    // add waits only on the LAST sub-chunk (c=C-1) of the parity.
+    cudaEvent_t recv_h2d_done[2][GGML_CUDA_AR_RING_SUBCHUNKS_MAX] = {};
+
+    // "Consumer drained its neighbor's host[parity]".  Indexed by the CONSUMER
+    // device (recorded on the consumer's own AR stream); the OWNER waits on its
+    // consumer's event before overwriting.  Per-parity because host[parity] is
+    // reused every two steps WITHIN one AR, so the fence must match parity.
+    cudaEvent_t host_read_done[2] = { nullptr, nullptr };
+    bool        host_read_done_valid[2] = { false, false };
+
+    // Reduce-scatter: the qn_a slot the next step sends is ready.  Recorded on
+    // the compute stream after the initial quantize and after each step's
+    // add+requantize; the step's D2H (AR stream) waits on it before reading
+    // qn_a.  Single rolling event is fine because enqueues are in-order.
+    cudaEvent_t send_ready = nullptr;
+
+    // All-gather: the send slot's re-quantize (compute stream) is done; gates
+    // the same step's D2H (AR stream) that reads it.
+    cudaEvent_t send_quant_done = nullptr;
+
+    // Reduce-scatter fully done on the compute stream.  All-gather H2Ds (AR
+    // stream) wait on it so they never overwrite qn_rx that reduce-scatter's
+    // add still reads.
+    cudaEvent_t rs_done = nullptr;
+
+    // "All reduce-scatter D2H reads of this rank's qn_a slots have drained".
+    // Recorded on this rank's d2h_stream where the last RS D2H copy finished;
+    // the compute stream waits on it before the all-gather requantize so it
+    // cannot overwrite a qn_a slot a still-running RS D2H is reading.  This is
+    // the device-local replacement for synchronizing the whole d2h_stream.
+    cudaEvent_t rs_send_done = nullptr;
+};
+
+struct ggml_cuda_ar_ring_resources {
+    int    n_devices    = 0;
+    int    dev_ids[GGML_CUDA_MAX_DEVICES] = {}; // CUDA device id per rank
+    size_t chunk_wire_max = 0; // max host[][parity] capacity allocated so far
+
+    ggml_cuda_ar_ring_rank rank[GGML_CUDA_MAX_DEVICES];
+};
+
 // Communication context for multi-GPU AllReduce during tensor parallelism.
 //
 // Created once per meta backend instance.  Resources for the selected mode
@@ -982,10 +1115,136 @@ struct ggml_backend_cuda_comm_context {
     try_allreduce_fn            try_allreduce = nullptr;
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
+    ggml_cuda_ar_ring_resources * ring = nullptr;   // lazy, ring all-reduce only
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
+
+    // Free the persistent ring resources: drain each AR stream (so no transfer
+    // touches a pinned host buffer / device buffer being freed), then destroy
+    // events, streams, and the double-buffered pinned host staging.
+    static void ggml_cuda_ar_ring_free(ggml_cuda_ar_ring_resources * ring) {
+        if (!ring) {
+            return;
+        }
+        // Drain BOTH transfer streams so no transfer touches a pinned host
+        // buffer / device buffer being freed.
+        for (int i = 0; i < ring->n_devices; ++i) {
+            if (ring->rank[i].d2h_stream || ring->rank[i].h2d_stream) {
+                ggml_cuda_set_device(ring->dev_ids[i]);
+                if (ring->rank[i].d2h_stream) { cudaStreamSynchronize(ring->rank[i].d2h_stream); }
+                if (ring->rank[i].h2d_stream) { cudaStreamSynchronize(ring->rank[i].h2d_stream); }
+            }
+        }
+        for (int i = 0; i < ring->n_devices; ++i) {
+            ggml_cuda_ar_ring_rank & rk = ring->rank[i];
+            const int dev = ring->dev_ids[i];
+            ggml_cuda_set_device(dev);
+            if (rk.host[0] || rk.host[1]) {
+                for (int p = 0; p < 2; ++p) {
+                    if (rk.host[p]) {
+                        if (rk.d2h_stream) { cudaStreamSynchronize(rk.d2h_stream); }
+                        if (rk.h2d_stream) { cudaStreamSynchronize(rk.h2d_stream); }
+                        cudaFreeHost(rk.host[p]);
+                    }
+                }
+            }
+            for (int p = 0; p < 2; ++p) {
+                for (int c = 0; c < GGML_CUDA_AR_RING_SUBCHUNKS_MAX; ++c) {
+                    if (rk.d2h_ready[p][c])     { cudaEventDestroy(rk.d2h_ready[p][c]); }
+                    if (rk.recv_h2d_done[p][c]) { cudaEventDestroy(rk.recv_h2d_done[p][c]); }
+                }
+                if (rk.host_read_done[p]) { cudaEventDestroy(rk.host_read_done[p]); }
+            }
+            if (rk.send_ready)       { cudaEventDestroy(rk.send_ready); }
+            if (rk.send_quant_done)  { cudaEventDestroy(rk.send_quant_done); }
+            if (rk.rs_done)          { cudaEventDestroy(rk.rs_done); }
+            if (rk.rs_send_done)     { cudaEventDestroy(rk.rs_send_done); }
+            if (rk.d2h_stream)       { cudaStreamDestroy(rk.d2h_stream); }
+            if (rk.h2d_stream)       { cudaStreamDestroy(rk.h2d_stream); }
+        }
+        delete ring;
+    }
+
+    // Lazily bring up the persistent ring resources on first ring entry (or
+    // grow the double-buffered pinned host staging to fit a larger chunk).
+    // Mirrors ggml_cuda_ar_pipeline_init's per-device stream/event creation.
+    // Returns nullptr on any error so the caller can fall back to the butterfly
+    // (graceful contract, no abort).
+    static ggml_cuda_ar_ring_resources * ggml_cuda_ar_ring_ensure(
+            ggml_backend_cuda_comm_context * comm_ctx, size_t chunk_wire) {
+        if (comm_ctx->ring) {
+            // Grow the pinned host staging if a larger chunk arrives.
+            if (chunk_wire > comm_ctx->ring->chunk_wire_max) {
+                for (int i = 0; i < comm_ctx->ring->n_devices; ++i) {
+                    ggml_cuda_ar_ring_rank & rk = comm_ctx->ring->rank[i];
+                    for (int p = 0; p < 2; ++p) {
+                        if (rk.host[p]) {
+                            ggml_cuda_set_device(comm_ctx->ring->dev_ids[i]);
+                            if (rk.d2h_stream) { cudaStreamSynchronize(rk.d2h_stream); }
+                            if (rk.h2d_stream) { cudaStreamSynchronize(rk.h2d_stream); }
+                            cudaFreeHost(rk.host[p]);
+                            rk.host[p] = nullptr;
+                        }
+                        if (cudaHostAlloc(reinterpret_cast<void **>(&rk.host[p]), chunk_wire,
+                                          cudaHostAllocPortable) != cudaSuccess) {
+                            return nullptr;
+                        }
+                    }
+                }
+                comm_ctx->ring->chunk_wire_max = chunk_wire;
+            }
+            return comm_ctx->ring;
+        }
+
+        const size_t n = comm_ctx->backends.size();
+        if (n < 1 || n > GGML_CUDA_MAX_DEVICES) {
+            return nullptr;
+        }
+
+        auto * ring = new (std::nothrow) ggml_cuda_ar_ring_resources();
+        if (!ring) {
+            return nullptr;
+        }
+        ring->n_devices     = (int) n;
+        ring->chunk_wire_max = chunk_wire;
+
+        for (size_t i = 0; i < n; ++i) {
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+            ggml_cuda_ar_ring_rank & rk = ring->rank[i];
+            ring->dev_ids[i] = cuda_ctx->device;
+            ggml_cuda_set_device(cuda_ctx->device);
+
+            bool ok =
+                cudaStreamCreateWithFlags(&rk.d2h_stream, cudaStreamNonBlocking) == cudaSuccess &&
+                cudaStreamCreateWithFlags(&rk.h2d_stream, cudaStreamNonBlocking) == cudaSuccess;
+            for (int p = 0; ok && p < 2; ++p) {
+                ok = ok &&
+                     cudaHostAlloc(reinterpret_cast<void **>(&rk.host[p]), chunk_wire,
+                                   cudaHostAllocPortable) == cudaSuccess &&
+                     cudaEventCreateWithFlags(&rk.host_read_done[p], cudaEventDisableTiming) == cudaSuccess;
+            }
+            for (int p = 0; ok && p < 2; ++p) {
+                for (int c = 0; ok && c < GGML_CUDA_AR_RING_SUBCHUNKS_MAX; ++c) {
+                    ok = ok &&
+                         cudaEventCreateWithFlags(&rk.d2h_ready[p][c], cudaEventDisableTiming) == cudaSuccess &&
+                         cudaEventCreateWithFlags(&rk.recv_h2d_done[p][c], cudaEventDisableTiming) == cudaSuccess;
+                }
+            }
+            ok = ok &&
+                 cudaEventCreateWithFlags(&rk.send_ready, cudaEventDisableTiming) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&rk.send_quant_done, cudaEventDisableTiming) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&rk.rs_done, cudaEventDisableTiming) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&rk.rs_send_done, cudaEventDisableTiming) == cudaSuccess;
+            if (!ok) {
+                ggml_cuda_ar_ring_free(ring);
+                return nullptr;
+            }
+        }
+        comm_ctx->ring = ring;
+        return ring;
+    }
 
     ~ggml_backend_cuda_comm_context() {
 #ifdef GGML_USE_NCCL
@@ -993,9 +1252,802 @@ struct ggml_backend_cuda_comm_context {
             NCCL_CHECK(ncclCommDestroy(comm));
         }
 #endif // GGML_USE_NCCL
+        ggml_cuda_ar_ring_free(ring);
         ggml_cuda_ar_pipeline_free(ar_pipeline);
     }
 };
+
+// ---------------------------------------------------------------------------
+// N-GPU quantized all-reduce (butterfly).
+//
+// NCCL cannot sum a block-quantized (Q8_0/Q5_0/Q4_0) buffer on the ring: each
+// 32-element block carries its own fp16 scale, and the scales differ per rank,
+// so the scale cannot be factored out of a plain integer sum and no nccl
+// datatype encodes {fp16 d; int8 qs[32]}.  When a quantized wire is selected
+// for an F32 reduction we instead run an all-reduce butterfly over log2(N)
+// rounds, exchanging each peer's on-wire buffer through pinned host memory and
+// accumulating locally with the quantized add kernel.  After the rounds every
+// rank holds the full wire-rounded sum, which is then inverse-rotated back
+// into the tensor.  This is how "q8_0 all-reduce for N > 2 GPUs" is achieved;
+// the NCCL ring itself stays F32/BF16.
+// ---------------------------------------------------------------------------
+static bool ggml_backend_cuda_comm_allreduce_quant_butterfly(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    const int64_t ne = ggml_nelements(tensors[0]);
+    const size_t n  = comm_ctx->backends.size();
+    if (n < 1) {
+        return false;
+    }
+
+    // Only F32 inputs are rotatable + quantizable.
+    if (tensors[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (ne == 0) {
+        return true;
+    }
+    if (!ggml_cuda_ar_quant_eligible(ne)) {
+        return false; // ne not rotatable -> BF16/F32 wire
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        GGML_ASSERT(tensors[i] != nullptr);
+        GGML_ASSERT(tensors[i]->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(tensors[i]) == ne);
+        GGML_ASSERT(ggml_is_contiguously_allocated(tensors[i]));
+    }
+
+    const ggml_cuda_ar_wire_config cfg = ggml_cuda_ar_wire_config_get();
+    const size_t f32_nbytes = (size_t) ne * sizeof(float);
+    const ggml_type wire = ggml_cuda_ar_pick_wire(cfg, true, f32_nbytes);
+    if (wire != GGML_TYPE_Q8_0 && wire != GGML_TYPE_Q5_0 && wire != GGML_TYPE_Q4_0) {
+        return false; // no quantized wire configured -> let the NCCL ring handle it
+    }
+
+    const size_t wire_nbytes = ggml_cuda_ar_wire_nbytes(ne, wire);
+    GGML_LOG_DEBUG("%s: quantized wire %s for %s (n=%zu, %" PRId64 " elems, %zu bytes -> %zu wire bytes)\n",
+                   __func__, ggml_type_name(wire), tensors[0]->name, n, ne, f32_nbytes, wire_nbytes);
+
+    // Zero inactive shards up-front (rotated + quantized zero stays exactly 0).
+    for (size_t i = 0; i < n; ++i) {
+        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+            ggml_cuda_set_device(cuda_ctx->device);
+            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+        }
+    }
+
+    // Per-rank rotated F32 accumulator and on-wire send/recv buffers (device),
+    // plus a pinned host staging slot per rank for the host-mediated exchange.
+    ggml_cuda_pool_alloc<float> rot_acc[GGML_CUDA_MAX_DEVICES];
+    ggml_cuda_pool_alloc<char>  qn_send[GGML_CUDA_MAX_DEVICES];
+    ggml_cuda_pool_alloc<char>  qn_recv[GGML_CUDA_MAX_DEVICES];
+    uint8_t * host[GGML_CUDA_MAX_DEVICES] = {};
+
+    // Forward rotate + quantize each rank's own slice, and allocate this
+    // rank's pinned host staging.
+    for (size_t i = 0; i < n; ++i) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+        ggml_cuda_set_device(cuda_ctx->device);
+        rot_acc[i].pool = &cuda_ctx->pool();
+        rot_acc[i].alloc((size_t) ne);
+        qn_send[i].pool = &cuda_ctx->pool();
+        qn_send[i].alloc(wire_nbytes);
+        qn_recv[i].pool = &cuda_ctx->pool();
+        qn_recv[i].alloc(wire_nbytes);
+
+        CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void **>(&host[i]), wire_nbytes,
+                                 cudaHostAllocPortable));
+
+        ggml_cuda_ar_fwht_forward(cuda_ctx->stream(), rot_acc[i].get(),
+                                  static_cast<const float *>(tensors[i]->data), ne);
+        CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_ar_quantize(cuda_ctx->stream(), qn_send[i].get(), rot_acc[i].get(), ne, wire);
+    }
+
+    // ------------------------------------------------------------------
+    // Exchange + accumulate over the butterfly.
+    //
+    // Transport selection: the butterfly's edges are pure point-to-point
+    // moves of a block-quantized on-wire buffer.  NCCL cannot express a
+    // block-quantized sum on a ring (see the comment above), so we drive the
+    // *transfers* directly rather than the reduction:
+    //
+    //   * NCCL build:  each directed edge (src -> dst) is one ncclSend /
+    //     ncclRecv pair, moved from qn_send[] straight into the peer's
+    //     qn_recv[] (device-to-device, P2P when the interconnect allows).
+    //     All edges of a round are fused into a single ncclGroupStart /
+    //     ncclGroupEnd group, so a single-threaded driver can issue every
+    //     rank's sends+receives without GPU deadlock; we synchronize once
+    //     after the round has been enqueued.
+    //   * Non-NCCL build: transfers are staged through pinned host memory
+    //     (D2H then H2D), the proven pattern for no-P2P / host-staged
+    //     systems.  All D2H stages run (blocking) before any H2D is
+    //     enqueued, so the round's exchanges overlap instead of stalling
+    //     per pair.
+    //
+    // Either way the participating ranks are synchronized once after each
+    // round, never inside a single pair, so the round's full exchange can
+    // overlap before anyone accumulates.
+    // ------------------------------------------------------------------
+    auto sync_all = [&]() {
+        for (size_t i = 0; i < n; ++i) {
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+            ggml_cuda_set_device(cuda_ctx->device);
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        }
+    };
+
+    // Perform a batch of directed transfers, each (src -> dst) moving
+    // qn_send[src] into qn_recv[dst], then synchronize all ranks.
+    //
+    // Transport: default is staging through pinned host memory, which is the
+    // only reliable option on host-staged rigs (no P2P, e.g. PCIe risers) where
+    // NCCL's point-to-point transport may be unavailable.  When the NCCL build
+    // is used *and* cross-GPU point-to-point is enabled with
+    // GGML_CUDA_AR_NCCL_P2P, the transfers instead run as ncclSend/ncclRecv
+    // pairs over the NCCL communicators (device-to-device, no host hop) with
+    // each round's edges fused into a single group.
+#ifdef GGML_USE_NCCL
+    // comms is empty when the butterfly runs without initialized NCCL
+    // communicators (GGML_CUDA_ALLREDUCE=none|internal, or NCCL init
+    // failure); fall back to host-staged transfers there.
+    const bool use_nccl_p2p = !comm_ctx->comms.empty() && getenv("GGML_CUDA_AR_NCCL_P2P") != nullptr;
+#else
+    const bool use_nccl_p2p = false;
+#endif // GGML_USE_NCCL
+    auto transact = [&](const std::vector<std::pair<size_t, size_t>> & edges) -> bool {
+        if (!use_nccl_p2p) {
+            // Host-staged.  Each distinct source stages its qn_send to its
+            // pinned host slot (async, on its own device stream so distinct
+            // sources overlap across the mesh), recording a per-source event
+            // when its D2H completes.  Every destination then waits only on
+            // the events of the sources it actually reads before pulling the
+            // data to device, so a fast source's H2D can overlap a slow
+            // source's D2H in the same round -- no global barrier inside the
+            // round.  All copies run async on their device streams.
+            cudaEvent_t host_ready[GGML_CUDA_MAX_DEVICES] = { nullptr };
+            for (const auto & e : edges) {
+                auto * cuda_ctx_src = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[e.first]->context);
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                if (!host_ready[e.first]) {
+                    CUDA_CHECK(cudaEventCreateWithFlags(&host_ready[e.first], cudaEventDisableTiming));
+                }
+            }
+            for (const auto & e : edges) {
+                auto * cuda_ctx_src = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[e.first]->context);
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                CUDA_CHECK(cudaMemcpyAsync(host[e.first], qn_send[e.first].get(), wire_nbytes,
+                                           cudaMemcpyDeviceToHost, cuda_ctx_src->stream()));
+                CUDA_CHECK(cudaEventRecord(host_ready[e.first], cuda_ctx_src->stream()));
+            }
+            for (const auto & e : edges) {
+                auto * cuda_ctx_dst = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[e.second]->context);
+                ggml_cuda_set_device(cuda_ctx_dst->device);
+                // Wait for this round's D2H of e.first to be visible.
+                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), host_ready[e.first], 0));
+                CUDA_CHECK(cudaMemcpyAsync(qn_recv[e.second].get(), host[e.first], wire_nbytes,
+                                           cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
+            }
+            for (size_t i = 0; i < n; ++i) {
+                if (host_ready[i]) {
+                    cudaEventDestroy(host_ready[i]);
+                }
+            }
+            sync_all();
+            return true;
+        }
+#ifdef GGML_USE_NCCL
+        // NCCL point-to-point: every rank enqueues its own sends and receives
+        // within one fused group; ncclGroupEnd waits for the group to complete.
+        NCCL_CHECK(ncclGroupStart());
+        for (size_t r = 0; r < n; ++r) {
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[r]->context);
+            ggml_cuda_set_device(cuda_ctx->device);
+            for (const auto & e : edges) {
+                if (e.first == r) {
+                    NCCL_CHECK(ncclSend(qn_send[r].get(), wire_nbytes,
+                                        ncclInt8, (int) e.second,
+                                        comm_ctx->comms[r], cuda_ctx->stream()));
+                }
+                if (e.second == r) {
+                    NCCL_CHECK(ncclRecv(qn_recv[r].get(), wire_nbytes,
+                                        ncclInt8, (int) e.first,
+                                        comm_ctx->comms[r], cuda_ctx->stream()));
+                }
+            }
+        }
+        NCCL_CHECK(ncclGroupEnd());
+#endif // GGML_USE_NCCL
+        sync_all();
+        return true;
+    };
+
+    // Butterfly topology (mirrors ggml-backend-meta.cpp allreduce_fallback):
+    // largest power of two <= n, fold any excess ranks first, then halve the
+    // stride until every lower-half rank holds the full sum.
+    size_t offset_j = n / 2;
+    while ((offset_j & (offset_j - 1)) != 0) {
+        offset_j--;
+    }
+    const size_t offset_j_max = offset_j;
+
+    // Fold excess (non-power-of-2) ranks into the lower half before the
+    // butterfly: src's contribution goes to dst, which accumulates + requantizes.
+    std::vector<std::pair<size_t, size_t>> fold_edges;
+    for (size_t j_src = 2 * offset_j_max; j_src < n; ++j_src) {
+        const size_t j_dst = j_src - 2 * offset_j_max;
+        fold_edges.emplace_back(j_src, j_dst);
+    }
+    transact(fold_edges);
+    for (const auto & e : fold_edges) {
+        auto * cuda_ctx_dst = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[e.second]->context);
+        ggml_cuda_set_device(cuda_ctx_dst->device);
+        ggml_cuda_ar_add_q_for_type(cuda_ctx_dst->stream(), rot_acc[e.second].get(),
+                                    qn_recv[e.second].get(), ne, wire);
+        ggml_cuda_ar_quantize(cuda_ctx_dst->stream(), qn_send[e.second].get(),
+                              rot_acc[e.second].get(), ne, wire);
+    }
+
+    // Butterfly reduction over the power-of-two ranks.  Each round, a pair
+    // exchanges its *current* partial sums in both directions *before* anyone
+    // accumulates, so each rank's contribution is added exactly once per round
+    // (recursive-halving: disjoint subsets combine per round).  After log2(N)
+    // rounds every power-of-two rank holds the full wire-rounded sum.
+    for (offset_j = offset_j_max; offset_j >= 1; offset_j /= 2) {
+        std::vector<std::pair<size_t, size_t>> edges;
+        for (size_t j = 0; j < 2 * offset_j_max; ++j) {
+            const size_t j_other = j ^ offset_j;
+            if (j_other >= n || j >= j_other) {
+                continue;
+            }
+            edges.emplace_back(j, j_other);
+            edges.emplace_back(j_other, j);
+        }
+        transact(edges);
+        // Accumulate both directions from the captured originals, then
+        // re-quantize qn_send for the next round.
+        for (size_t j = 0; j < 2 * offset_j_max; ++j) {
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[j]->context);
+            ggml_cuda_set_device(cuda_ctx->device);
+            ggml_cuda_ar_add_q_for_type(cuda_ctx->stream(), rot_acc[j].get(),
+                                        qn_recv[j].get(), ne, wire);
+            ggml_cuda_ar_quantize(cuda_ctx->stream(), qn_send[j].get(),
+                                  rot_acc[j].get(), ne, wire);
+        }
+    }
+
+    // Copy the reduced result back to the excess (non-power-of-2) ranks.  The
+    // excess rank's own accumulator holds only its own contribution (it was a
+    // pure sender during the fold), so it must be replaced, not summed: zero
+    // it first, then a plain add installs the received full-sum wire.
+    std::vector<std::pair<size_t, size_t>> back_edges;
+    for (size_t j = 2 * offset_j_max; j < n; ++j) {
+        back_edges.emplace_back(j - 2 * offset_j_max, j);
+    }
+    transact(back_edges);
+    for (const auto & e : back_edges) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[e.second]->context);
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaMemsetAsync(rot_acc[e.second].get(), 0, (size_t) ne * sizeof(float), cuda_ctx->stream()));
+        ggml_cuda_ar_add_q_for_type(cuda_ctx->stream(), rot_acc[e.second].get(),
+                                    qn_recv[e.second].get(), ne, wire);
+    }
+    sync_all();
+
+    // Inverse rotate back into the tensor on every rank.
+    for (size_t i = 0; i < n; ++i) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+        ggml_cuda_set_device(cuda_ctx->device);
+        ggml_cuda_ar_fwht_inverse(cuda_ctx->stream(),
+                                  static_cast<float *>(tensors[i]->data),
+                                  rot_acc[i].get(), ne);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        if (host[i]) {
+            cudaFreeHost(host[i]);
+            host[i] = nullptr;
+        }
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// N-GPU quantized all-reduce via a bandwidth-optimal RING.
+//
+// The butterfly above is all-to-all: every rank sends its full on-wire buffer
+// to each of its ~log2(N) partners, so it moves ~2N wire bytes per rank (N=8:
+// ~6x) even though the reduction is only a sum.  NCCL's fast BF16 path instead
+// uses a ring (reduce-scatter + all-gather), where each rank talks only to its
+// two ring neighbours and the data shuttles around, moving only ~2x its own
+// wire -- ~3x less traffic for N=8.  That is why the BF16 control beats the q8
+// butterfly on a bandwidth-bound prefill.
+//
+// This implements the same ring topology over a *quantized* (block-encoded)
+// wire using the shared quantize / q-add kernels.  Index algebra (verified
+// against a source-tracking simulation for N=4):
+//   Reduce-scatter (N-1 steps, step s): rank sends slot (r-s) right, folds slot
+//     (r-s-1) from the left into the local accumulator, re-quantizes.  After
+//     N-1 steps slot (r+1) mod N holds the complete wire-rounded chunk.
+//   All-gather (N-1 steps): the completed chunks rotate around the ring
+//     (send slot (r-s+1) right, install slot (r-s) from the left, replace the
+//     target) until every rank holds all N chunks.
+//
+// Gated by GGML_CUDA_AR_QUANT_NO_RING (any value disables, falling back to
+// the butterfly); on by default.  See the dispatcher below.
+// ---------------------------------------------------------------------------
+static bool ggml_backend_cuda_comm_allreduce_quant_ring(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    const int64_t ne = ggml_nelements(tensors[0]);
+    const size_t n  = comm_ctx->backends.size();
+    if (n < 2 || (n & (n - 1)) != 0) {
+        return false; // ring needs a power-of-two rank count
+    }
+    if (tensors[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (ne == 0) {
+        return true;
+    }
+    if (!ggml_cuda_ar_quant_eligible(ne)) {
+        return false;
+    }
+    if ((int64_t) n > ne || (ne % (int64_t) n) != 0 || ((ne / (int64_t) n) % QK8_0) != 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        GGML_ASSERT(tensors[i] != nullptr);
+        GGML_ASSERT(tensors[i]->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(tensors[i]) == ne);
+        GGML_ASSERT(ggml_is_contiguously_allocated(tensors[i]));
+    }
+
+    const ggml_cuda_ar_wire_config cfg = ggml_cuda_ar_wire_config_get();
+    const size_t f32_nbytes = (size_t) ne * sizeof(float);
+    const ggml_type wire = ggml_cuda_ar_pick_wire(cfg, true, f32_nbytes);
+    if (wire != GGML_TYPE_Q8_0 && wire != GGML_TYPE_Q5_0 && wire != GGML_TYPE_Q4_0) {
+        return false; // no quantized wire configured -> let the NCCL ring handle it
+    }
+
+    const size_t wire_nbytes   = ggml_cuda_ar_wire_nbytes(ne, wire);
+    const size_t chunk_elems   = (size_t) (ne / (int64_t) n);        // elems per chunk
+    // Wire bytes per chunk.  Do NOT derive via wire_nbytes/ne: that integer
+    // division truncates the fractional block overhead (Q8_0 = 34/32 B/el,
+    // Q5_0/Q4_0 likewise), which would undersize each chunk's on-wire buffer and
+    // misalign the per-chunk D2H/H2D copies, corrupting the tail of every chunk
+    // (NaN).  Because the ring requires each chunk's element count to be a
+    // multiple of the wire block size, wire_nbytes is n-divisible and this exact
+    // division yields the true per-chunk wire bytes.
+    const size_t chunk_wire    = wire_nbytes / n;                    // wire bytes per chunk
+
+    GGML_LOG_DEBUG("ggml_backend_cuda_comm_allreduce_quant_ring: quantized wire %s via ring for %s (n=%zu, %"
+                   PRId64 " elems, %zu bytes -> %zu wire bytes, %zu B/chunk)\n",
+                   ggml_type_name(wire), tensors[0]->name, n, ne, f32_nbytes, wire_nbytes, chunk_wire);
+
+    // Zero inactive shards.
+    for (size_t i = 0; i < n; ++i) {
+        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+            ggml_cuda_set_device(cuda_ctx->device);
+            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+        }
+    }
+
+    // Persistent per-ring-rank resources (created lazily on first use and
+    // grown to fit this call's chunk).  The double-buffered pinned host staging
+    // survives across all-reduce calls; transfers run on dedicated non-blocking
+    // AR streams so they can overlap the compute stream's add/quant kernels.
+    ggml_cuda_ar_ring_resources * ring = ggml_backend_cuda_comm_context::ggml_cuda_ar_ring_ensure(comm_ctx, chunk_wire);
+    if (!ring) {
+        return false; // resource bring-up failed -> let the butterfly fallback handle it
+    }
+
+    // Cross-AR serialization for the reused per-call pooled device buffers.
+    // rot_acc / qn_a / qn_rx come from the per-backend CUDA pool and are freed
+    // to it when this call returns; the model's next all-reduce (same `ne`,
+    // same pool bucket) and the producer kernels feeding it reuse those exact
+    // blocks.  They are written and read on the COMPUTE stream (fwht_forward,
+    // add/requantize, inverse rotate) and on the transfer streams.  Draining
+    // only the H2D stream at end-of-call leaves the compute stream's writes in
+    // flight across calls, so the next call / producer can overtake the prior
+    // ring's compute work on the reused blocks and corrupt one slot every so
+    // often (the "occasional incoherence").  Synchronizing each rank's compute
+    // stream before this call allocates / reuses the pool buffers -- and before
+    // it reads its own input -- is the honest ordering guarantee.  It is NOT a
+    // full device barrier and does not disturb the intra-call D2H/H2D overlap.
+    for (size_t i = 0; i < n; ++i) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+        ggml_cuda_set_device(cuda_ctx->device);
+        cudaStreamSynchronize(cuda_ctx->stream());
+    }
+
+    // Per-rank rotated F32 accumulator (ne), dual on-wire buffers.  Device
+    // buffers are still per-call from the pool, but the pinned host staging and
+    // streams belong to `ring` and persist.
+    ggml_cuda_pool_alloc<float> rot_acc[GGML_CUDA_MAX_DEVICES];
+    ggml_cuda_pool_alloc<char>  qn_a  [GGML_CUDA_MAX_DEVICES];
+    ggml_cuda_pool_alloc<char>  qn_rx [GGML_CUDA_MAX_DEVICES];
+
+    for (size_t i = 0; i < n; ++i) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+        ggml_cuda_set_device(cuda_ctx->device);
+        rot_acc[i].pool = &cuda_ctx->pool();
+        rot_acc[i].alloc((size_t) ne);
+        qn_a[i].pool = &cuda_ctx->pool();
+        qn_a[i].alloc(wire_nbytes);
+        qn_rx[i].pool = &cuda_ctx->pool();
+        qn_rx[i].alloc(wire_nbytes);
+
+        ggml_cuda_ar_fwht_forward(cuda_ctx->stream(), rot_acc[i].get(),
+                                  static_cast<const float *>(tensors[i]->data), ne);
+        CUDA_CHECK(cudaGetLastError());
+        ggml_cuda_ar_quantize(cuda_ctx->stream(), qn_a[i].get(), rot_acc[i].get(), ne, wire);
+        // The reduce-scatter step-0 D2H (AR stream) must not read qn_a until the
+        // forward quantize above completes on the compute stream.
+        CUDA_CHECK(cudaEventRecord(ring->rank[i].send_ready, cuda_ctx->stream()));
+    }
+
+    auto stride = [&](int64_t v) -> int64_t { return (v % (int64_t) n + (int64_t) n) % (int64_t) n; };
+
+    const int64_t nn = (int64_t) n;
+
+    // Per-step sub-chunk geometry.  chunk_wire is already exact per-rank wire
+    // (wire_nbytes / n).  Pick the largest C in [1..GGML_CUDA_AR_RING_SUBCHUNKS]
+    // (env-overridable) that divides chunk_wire exactly and keeps each
+    // sub-chunk wire-block aligned (sub_wire a multiple of the wire block
+    // size).  Falls back to 1 = monolithic single-copy (old behavior).
+    int    C = ggml_cuda_ar_ring_subchunks();
+    size_t block_wire = 1;
+    switch (wire) {
+        case GGML_TYPE_Q8_0: block_wire = sizeof(block_q8_0); break;
+        case GGML_TYPE_Q5_0: block_wire = sizeof(block_q5_0); break;
+        case GGML_TYPE_Q4_0: block_wire = sizeof(block_q4_0); break;
+        default:             block_wire = 1;                  break;
+    }
+    size_t sub_wire = chunk_wire;
+    for (; C > 1; --C) {
+        if (chunk_wire % C == 0 && (chunk_wire / C) % block_wire == 0) {
+            sub_wire = chunk_wire / C;
+            break;
+        }
+    }
+    GGML_LOG_DEBUG("ggml_backend_cuda_comm_allreduce_quant_ring: %zu B/chunk split into C=%d sub-chunks of %zu B (block %zu B)\n",
+                   chunk_wire, C, sub_wire, block_wire);
+
+    // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Reduce-scatter (N-1 steps, step s): each rank sends slot (r-s) right and
+    // folds slot (r-s-1) from the left.  D2H sends run on each rank's d2h_stream,
+    // H2D pulls on its h2d_stream (so a rank's two directions overlap);
+    // add/quant runs on the compute stream, handed off via events.
+    //
+    // Event/pipeline wiring per step (parity p = s%2):
+    //   * rank r first waits (its d2h_stream) on send_ready (compute stream) so
+    //     the qn_a slot it is about to stage from is fully computed, then
+    //     waits on its consumer's host_read_done[p] so its pinned host[parity]
+    //     (reused every two steps within this AR) is drained, then D2H-stages
+    //     qn_a[r]+sc*chunk_wire into host[r][p] in C sub-chunks, recording
+    //     d2h_ready[r][p][0..C-1].
+    //   * the consumer (rank r, left = (r-1)%n) waits its h2d_stream on each
+    //     d2h_ready[left][p][c] -- only that single source -- pulls
+    //     host[left][p] into qn_rx[r]+rc*chunk_wire sub-chunk by sub-chunk,
+    //     recording recv_h2d_done[r][p][c] (its own event, gating its compute
+    //     add) and, on the last sub-chunk, host_read_done[r][p] (indexed by the
+    //     consumer device, so owner (r-1)%n can reuse its slot).
+    //   * the compute stream waits on recv_h2d_done[r][p][C-1], runs
+    //     add+requantize,
+    //     then records send_ready so the next D2H of the freshly computed qn_a
+    //     slot can proceed.  Because consecutive steps use opposite parity and
+    //     touch disjoint slots, step s+1's transfers overlap step s's compute.
+    //
+    // No global barrier inside any step: the per-step edge graph is a single
+    // directed cycle of per-source events and is acyclic.
+    // ------------------------------------------------------------------
+    for (int64_t s = 0; s < nn - 1; ++s) {
+        const int p = (int)(s % 2);
+
+        // -- Sends: stage each rank's qn_a slot (r-s) to its parity host slot,
+        //          split into C sub-chunks on the D2H stream.
+        for (size_t r = 0; r < n; ++r) {
+            ggml_cuda_ar_ring_rank & rk = ring->rank[r];
+            auto * c_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[r]->context);
+            ggml_cuda_set_device(c_ctx->device);
+            const int64_t sc = stride((int64_t) r - s);
+            const int64_t consumer = (int64_t) (r + 1) % n;
+            const ggml_cuda_ar_ring_rank & crk = ring->rank[consumer];
+
+            // qn_a slot is ready (initial quantize or the prior step's
+            // add+requantize), recorded on the compute stream's single rolling
+            // send_ready; waits are in enqueue order so each step consumes the
+            // latest record.
+            CUDA_CHECK(cudaStreamWaitEvent(rk.d2h_stream, rk.send_ready, 0));
+            // host[parity] drained by consumer last time this parity was used.
+            if (crk.host_read_done_valid[p]) {
+                CUDA_CHECK(cudaStreamWaitEvent(rk.d2h_stream, crk.host_read_done[p], 0));
+            }
+            for (int c = 0; c < C; ++c) {
+                CUDA_CHECK(cudaMemcpyAsync(rk.host[p] + (size_t) c * sub_wire,
+                                           qn_a[r].get() + (size_t) sc * chunk_wire + (size_t) c * sub_wire,
+                                           sub_wire, cudaMemcpyDeviceToHost, rk.d2h_stream));
+                CUDA_CHECK(cudaEventRecord(rk.d2h_ready[p][c], rk.d2h_stream));
+            }
+        }
+
+        // -- Pulls: each rank pulls its left neighbour's staged chunk,
+        //          split into C sub-chunks on the H2D stream.
+        for (size_t r = 0; r < n; ++r) {
+            ggml_cuda_ar_ring_rank & rk = ring->rank[r];
+            auto * c_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[r]->context);
+            ggml_cuda_set_device(c_ctx->device);
+            const size_t  left = (r + n - 1) % n;
+            const int64_t rc   = stride((int64_t) r - s - 1);
+            const ggml_cuda_ar_ring_rank & lk = ring->rank[left];
+
+            for (int c = 0; c < C; ++c) {
+                CUDA_CHECK(cudaStreamWaitEvent(rk.h2d_stream, lk.d2h_ready[p][c], 0));
+                CUDA_CHECK(cudaMemcpyAsync(qn_rx[r].get() + (size_t) rc * chunk_wire + (size_t) c * sub_wire,
+                                           lk.host[p] + (size_t) c * sub_wire, sub_wire,
+                                           cudaMemcpyHostToDevice, rk.h2d_stream));
+                CUDA_CHECK(cudaEventRecord(rk.recv_h2d_done[p][c], rk.h2d_stream));
+                if (c == C - 1) {
+                    // This rank (the consumer of host[left]) is done reading
+                    // it, and only the last sub-chunk closes the read -- never
+                    // early (that would let the owner overwrite live data).
+                    CUDA_CHECK(cudaEventRecord(rk.host_read_done[p], rk.h2d_stream));
+                    rk.host_read_done_valid[p] = true;
+                }
+            }
+        }
+
+        // -- Add + requantize on the compute stream.
+        // By default (GGML_CUDA_AR_RING_EARLY_ADD unset) each sub-chunk's
+        // add+quantize is launched as soon as that sub-chunk's H2D lands
+        // (recv_h2d_done[p][c]), so earlier sub-chunks are computed while
+        // later ones are still arriving ("early add").  Setting
+        // GGML_CUDA_AR_RING_EARLY_ADD to a recognized off-string reverts to
+        // the monolithic path, where the compute add reads the whole
+        // freshly-pulled qn_rx slot, waits only on the LAST sub-chunk of the
+        // parity and does the whole chunk's add+quantize at once (one kernel
+        // pair per chunk).  The add_q and quantize kernels are blockwise
+        // independent (each QK-block touches only its own region), so the
+        // per-sub-chunk result is block-identical to the monolithic one and
+        // all ranks still converge bitwise-identically.  The FWHT and the rest
+        // of the ring algebra are unchanged in both modes.
+        const size_t sub_elems = chunk_elems / (size_t) C; // elems per sub-chunk
+        for (size_t r = 0; r < n; ++r) {
+            ggml_cuda_ar_ring_rank & rk = ring->rank[r];
+            auto * c_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[r]->context);
+            ggml_cuda_set_device(c_ctx->device);
+            const int64_t rc = stride((int64_t) r - s - 1);
+            if (ggml_cuda_ar_ring_early_add()) {
+                for (int c = 0; c < C; ++c) {
+                    CUDA_CHECK(cudaStreamWaitEvent(c_ctx->stream(), rk.recv_h2d_done[p][c], 0));
+                    ggml_cuda_ar_add_q_for_type(c_ctx->stream(),
+                                                rot_acc[r].get() + (size_t) rc * chunk_elems + (size_t) c * sub_elems,
+                                                qn_rx[r].get() + (size_t) rc * chunk_wire + (size_t) c * sub_wire,
+                                                sub_elems, wire);
+                    ggml_cuda_ar_quantize(c_ctx->stream(),
+                                          qn_a[r].get() + (size_t) rc * chunk_wire + (size_t) c * sub_wire,
+                                          rot_acc[r].get() + (size_t) rc * chunk_elems + (size_t) c * sub_elems,
+                                          sub_elems, wire);
+                }
+            } else {
+                CUDA_CHECK(cudaStreamWaitEvent(c_ctx->stream(), rk.recv_h2d_done[p][C - 1], 0));
+                ggml_cuda_ar_add_q_for_type(c_ctx->stream(),
+                                            rot_acc[r].get() + (size_t) rc * chunk_elems,
+                                            qn_rx[r].get() + (size_t) rc * chunk_wire,
+                                            chunk_elems, wire);
+                ggml_cuda_ar_quantize(c_ctx->stream(),
+                                      qn_a[r].get() + (size_t) rc * chunk_wire,
+                                      rot_acc[r].get() + (size_t) rc * chunk_elems,
+                                      chunk_elems, wire);
+            }
+            // The freshly computed qn_a slot is now safe for the next D2H.
+            CUDA_CHECK(cudaEventRecord(rk.send_ready, c_ctx->stream()));
+        }
+    }
+
+    // Reduce-scatter done on every compute stream: the all-gather H2Ds below
+    // must not overwrite qn_rx that reduce-scatter's add still reads.  Because
+    // all AR streams run copy-ops and all compute streams run kernels, the
+    // in-order (AR-stream) recording on each rank's *receiver* pair would be
+    // needed; instead we gate all-gather step 0's H2D on reduce-scatter's
+    // completion via a single compute-stream->AR-stream handoff per rank.
+    for (size_t r = 0; r < n; ++r) {
+        ggml_cuda_ar_ring_rank & rk = ring->rank[r];
+        auto * c_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[r]->context);
+        ggml_cuda_set_device(c_ctx->device);
+        CUDA_CHECK(cudaEventRecord(rk.rs_done, c_ctx->stream()));
+    }
+
+    // Order the compute stream behind each rank's send-side D2H stream.  The
+    // all-gather send loop below re-quantizes qn_a slots on the COMPUTE stream
+    // (sc = stride(r - s2 + 1)), and those are exactly the qn_a regions that
+    // reduce-scatter's D2H copies (on the independent d2h_stream) read when
+    // they staged each slot during the reduce-scatter loop.  rs_done orders
+    // only reduce-scatter's compute-side work (adds/requantizes) on the
+    // compute stream -- it does NOT order the D2H copies on d2h_stream (a
+    // distinct, non-blocking stream whose only handoff is d2h_ready -> the
+    // pulls' H2D).  Without ordering, an in-flight RS D2H could still be
+    // reading a qn_a region while the all-gather requantize overwrites it,
+    // staging a torn chunk to host and corrupting one slot every so often
+    // (the "occasional incoherence").  A per-rank event record on d2h_stream
+    // (where the last RS D2H finished) is the honest ordering guarantee: the
+    // compute stream waits on it without draining the stream or stalling the
+    // host, so all-gather's D2H/H2D pipelining is unaffected.  rs_done is kept
+    // separately since the all-gather H2D pulls still rely on it.
+    for (size_t i = 0; i < n; ++i) {
+        ggml_cuda_ar_ring_rank & rk = ring->rank[i];
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+        ggml_cuda_set_device(cuda_ctx->device);
+        // ALL RS D2H reads of qn_a have drained; order the compute stream so the
+        // AG requantize cannot overwrite a slot a still-running RS D2H is reading.
+        CUDA_CHECK(cudaEventRecord(rk.rs_send_done, rk.d2h_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), rk.rs_send_done, 0));
+    }
+
+    // ------------------------------------------------------------------
+    // All-gather (N-1 steps, step s2): each rank sends the completed slot
+    // (r-s2+1) right and installs slot (r-s2) from the left, replacing it
+    // (zero then add).  Same parity double-buffered host and event handoff as
+    // reduce-scatter.  Because the reduce-scatter add reads qn_rx on the
+    // compute stream, step 0's H2D waits for rs_done before overwriting qn_rx;
+    // subsequent steps' wiring is identical to reduce-scatter.
+    // ------------------------------------------------------------------
+    for (int64_t s2 = 0; s2 < nn - 1; ++s2) {
+        const int p = (int)(s2 % 2);
+
+        // -- Quantize (compute stream) + stage the completed send slot
+        //          (r - s2 + 1) in C sub-chunks on the D2H stream.
+        //
+        // Note: the send slot re-quantize reads rot_acc (assembled during
+        // reduce-scatter) and runs on the compute stream, so it is naturally
+        // ordered after reduce-scatter by compute-stream in-order semantics --
+        // no cross-stream wait needed for the quantize itself.  The D2H on the
+        // D2H stream reads qn_a (written fresh by this quantize and, before it,
+        // by reduce-scatter's last requantize), so the D2H stream waits on the
+        // freshly-recorded send_quant_done.  On step 0 this same wait also
+        // transitively orders the D2H after reduce-scatter, because the quantize
+        // that records send_quant_done runs after reduce-scatter on the compute
+        // stream.  host[parity] reuse is gated on the consumer's host_read_done.
+        for (size_t r = 0; r < n; ++r) {
+            ggml_cuda_ar_ring_rank & rk = ring->rank[r];
+            auto * c_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[r]->context);
+            ggml_cuda_set_device(c_ctx->device);
+            const int64_t sc = stride((int64_t) r - s2 + 1);
+            const int64_t consumer = (int64_t) (r + 1) % n;
+            const ggml_cuda_ar_ring_rank & crk = ring->rank[consumer];
+
+            ggml_cuda_ar_quantize(c_ctx->stream(),
+                                  qn_a[r].get() + (size_t) sc * chunk_wire,
+                                  rot_acc[r].get() + (size_t) sc * chunk_elems,
+                                  chunk_elems, wire);
+            // Owner round-trip: install the owner's OWN distributed slot back
+            // into rot_acc as the q8-dequant wire value, byte-identical to what
+            // every receiver installs in the AG replace phase (memset-0 then
+            // add_q == copy of dequant(qn_a[sc])).  Without this the owner keeps
+            // the un-rounded float for its own slot while all other ranks hold
+            // the q8-rounded copy, making every rank bitwise-divergent.
+            CUDA_CHECK(cudaMemsetAsync(rot_acc[r].get() + (size_t) sc * chunk_elems, 0,
+                                       chunk_elems * sizeof(float), c_ctx->stream()));
+            ggml_cuda_ar_add_q_for_type(c_ctx->stream(),
+                                        rot_acc[r].get() + (size_t) sc * chunk_elems,
+                                        qn_a[r].get() + (size_t) sc * chunk_wire,
+                                        chunk_elems, wire);
+            CUDA_CHECK(cudaEventRecord(rk.send_quant_done, c_ctx->stream()));
+            CUDA_CHECK(cudaStreamWaitEvent(rk.d2h_stream, rk.send_quant_done, 0));
+            if (crk.host_read_done_valid[p]) {
+                CUDA_CHECK(cudaStreamWaitEvent(rk.d2h_stream, crk.host_read_done[p], 0));
+            }
+            for (int c = 0; c < C; ++c) {
+                CUDA_CHECK(cudaMemcpyAsync(rk.host[p] + (size_t) c * sub_wire,
+                                           qn_a[r].get() + (size_t) sc * chunk_wire + (size_t) c * sub_wire,
+                                           sub_wire, cudaMemcpyDeviceToHost, rk.d2h_stream));
+                CUDA_CHECK(cudaEventRecord(rk.d2h_ready[p][c], rk.d2h_stream));
+            }
+        }
+
+        // -- Pulls: each rank installs the completed slot (r - s2) from left in
+        //          C sub-chunks on the H2D stream.
+        //
+        // The pull H2D overwrites qn_rx, which reduce-scatter's add read on the
+        // compute stream.  Because the H2D stream and compute stream are
+        // independent, gate EVERY pull on rs_done (the receive-side mirror of
+        // the RS->AG seam) so a pull cannot overtake a still-running reduce-
+        // scatter add on the same rank's own qn_rx slots.  rs_done is recorded
+        // on the compute stream after reduce-scatter, so an unconditional wait
+        // here is never deadlocked and correctly orders every AG step.
+        for (size_t r = 0; r < n; ++r) {
+            ggml_cuda_ar_ring_rank & rk = ring->rank[r];
+            auto * c_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[r]->context);
+            ggml_cuda_set_device(c_ctx->device);
+            const size_t  left = (r + n - 1) % n;
+            const int64_t rc   = stride((int64_t) r - s2);
+            const ggml_cuda_ar_ring_rank & lk = ring->rank[left];
+
+            CUDA_CHECK(cudaStreamWaitEvent(rk.h2d_stream, rk.rs_done, 0));
+            for (int c = 0; c < C; ++c) {
+                CUDA_CHECK(cudaStreamWaitEvent(rk.h2d_stream, lk.d2h_ready[p][c], 0));
+                CUDA_CHECK(cudaMemcpyAsync(qn_rx[r].get() + (size_t) rc * chunk_wire + (size_t) c * sub_wire,
+                                           lk.host[p] + (size_t) c * sub_wire, sub_wire,
+                                           cudaMemcpyHostToDevice, rk.h2d_stream));
+                CUDA_CHECK(cudaEventRecord(rk.recv_h2d_done[p][c], rk.h2d_stream));
+                if (c == C - 1) {
+                    // Consumer done reading host[left] -- only after the last
+                    // sub-chunk; never early.
+                    CUDA_CHECK(cudaEventRecord(rk.host_read_done[p], rk.h2d_stream));
+                    rk.host_read_done_valid[p] = true;
+                }
+            }
+        }
+
+        // -- Replace (zero then add == copy) on the compute stream.  Waits on
+        // the last sub-chunk, then does the whole chunk at once.
+        for (size_t r = 0; r < n; ++r) {
+            ggml_cuda_ar_ring_rank & rk = ring->rank[r];
+            auto * c_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[r]->context);
+            ggml_cuda_set_device(c_ctx->device);
+            const int64_t rc = stride((int64_t) r - s2);
+            CUDA_CHECK(cudaStreamWaitEvent(c_ctx->stream(), rk.recv_h2d_done[p][C - 1], 0));
+            CUDA_CHECK(cudaMemsetAsync(rot_acc[r].get() + (size_t) rc * chunk_elems, 0,
+                                       chunk_elems * sizeof(float), c_ctx->stream()));
+            ggml_cuda_ar_add_q_for_type(c_ctx->stream(),
+                                        rot_acc[r].get() + (size_t) rc * chunk_elems,
+                                        qn_rx[r].get() + (size_t) rc * chunk_wire,
+                                        chunk_elems, wire);
+        }
+    }
+
+    // Inverse rotate on every rank.  The last all-gather add runs on the compute
+    for (size_t i = 0; i < n; ++i) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+        ggml_cuda_set_device(cuda_ctx->device);
+        ggml_cuda_ar_fwht_inverse(cuda_ctx->stream(),
+                                  static_cast<float *>(tensors[i]->data),
+                                  rot_acc[i].get(), ne);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // The final H2D pulls (on the H2D streams) and the last adds (on the
+    // compute streams) must complete before the next all-reduce overwrites the
+    // reused persistent buffers and reads the assembled result.  The
+    // compute-stream in-order rule guarantees the inverse read the final
+    // rot_acc.  For device buffer / host reuse across calls, drain each H2D
+    // stream once here (the cross-AR host_read_done/comp fences cover the
+    // stage-level overlap; a single sync is the honest, safe ordering guarantee
+    // and is not a per-step barrier).  The D2H streams are fully ordered ahead
+    // of the H2D streams for their parity via the d2h_ready handshakes, plus
+    // the cross-AR host_read_done fence on the next AR's D2H; draining the H2D
+    // streams is sufficient protection for the freed/reused host staging across
+    // calls.
+    for (size_t i = 0; i < n; ++i) {
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[i]->context);
+        ggml_cuda_set_device(cuda_ctx->device);
+        cudaStreamSynchronize(ring->rank[i].h2d_stream);
+    }
+
+    return true;
+}
+// Shared dispatch for the N-GPU quantized all-reduce.  Prefers the
+// bandwidth-optimal ring when it is compatible (power-of-two ranks, chunk
+// block-aligned); set GGML_CUDA_AR_QUANT_NO_RING to use the all-to-all
+// butterfly instead.  Both honor the same wire thresholds, so either returns
+// false, letting the caller use the F32/BF16 path.
+static bool ggml_backend_cuda_comm_allreduce_quant_dispatch(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    if (getenv("GGML_CUDA_AR_QUANT_NO_RING") == nullptr) {
+        if (ggml_backend_cuda_comm_allreduce_quant_ring(comm_ctx, tensors)) {
+            return true;
+        }
+    }
+    return ggml_backend_cuda_comm_allreduce_quant_butterfly(comm_ctx, tensors);
+}
+
 
 #ifdef GGML_USE_NCCL
 // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
@@ -1033,6 +2085,17 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
             NCCL_CHECK(ncclAllReduce(tensors[i]->data, tensors[i]->data, ne, ncclFloat, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()));
         }
         NCCL_CHECK(ncclGroupEnd());
+        return true;
+    }
+
+    // Large tensors: if a quantized wire (Q8_0/Q5_0/Q4_0) is enabled and this
+    // F32 tensor is rotatable, route to the N-GPU quantized reducer (a
+    // bandwidth-optimal ring when compatible and enabled, else the butterfly) --
+    // NCCL cannot sum a block-quantized buffer on the ring (see
+    // allreduce_quant_butterfly).
+    if (tensors[0]->type == GGML_TYPE_F32 &&
+        ggml_cuda_ar_quant_eligible(ne) &&
+        ggml_backend_cuda_comm_allreduce_quant_dispatch(comm_ctx, tensors)) {
         return true;
     }
 
@@ -1142,8 +2205,19 @@ static bool ggml_backend_cuda_comm_try_allreduce_internal(
 }
 
 static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
-        ggml_backend_cuda_comm_context *, struct ggml_tensor **) {
-    return false;
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    // With no NCCL ring, still honor a quantized wire via the ring/butterfly.
+    if (tensors != nullptr && tensors[0] != nullptr) {
+        const int64_t ne = ggml_nelements(tensors[0]);
+        if (ne > 0 && tensors[0]->type == GGML_TYPE_F32 && ggml_cuda_ar_quant_eligible(ne)) {
+            const ggml_cuda_ar_wire_config cfg = ggml_cuda_ar_wire_config_get();
+            const ggml_type wire = ggml_cuda_ar_pick_wire(cfg, true, (size_t) ne * sizeof(float));
+            if (wire == GGML_TYPE_Q8_0 || wire == GGML_TYPE_Q5_0 || wire == GGML_TYPE_Q4_0) {
+                return ggml_backend_cuda_comm_allreduce_quant_dispatch(comm_ctx, tensors);
+            }
+        }
+    }
+    return false; // otherwise let the meta backend's generic butterfly run
 }
 
 static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {

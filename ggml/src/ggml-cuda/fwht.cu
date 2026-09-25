@@ -59,6 +59,78 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
     }
 }
 
+// Largest power of two in {64, 128, 256, 512} that divides `ne`, or 0 if none
+// does. Shared by the buffer-level rotation below and by the AllReduce
+// wire-type selector (which must not pick a quantized wire when ne isn't
+// rotatable).  A multiple of 64 is the smallest acceptable rotation so that
+// the FWHT kernel's vectorized row width lines up cleanly with the on-block
+// quantization.
+int ggml_cuda_ar_fwht_n(int64_t ne) {
+    if      (ne % 512 == 0) { return 512; }
+    else if (ne % 256 == 0) { return 256; }
+    else if (ne % 128 == 0) { return 128; }
+    else if (ne %  64 == 0) { return 64;  }
+    return 0;
+}
+
+// Buffer-level FWHT for the internal AllReduce quantized-wire path. Both the
+// forward and inverse rotation use the same kernel: the Walsh-Hadamard matrix
+// is its own inverse up to the n-fold scaling, and the kernel normalizes by
+// 1/sqrt(n) on every application, so applying it twice restores the input
+// exactly. `ne` (element count) must be a multiple of the chosen power-of-two
+// `n`; returns false if no such n in {64, 128, 256, 512} divides ne.
+static bool ggml_cuda_ar_fwht_rotation(
+        cudaStream_t stream, float * dst, const float * src, int64_t ne) {
+    const int n = ggml_cuda_ar_fwht_n(ne);
+    if (n == 0) {
+        return false;
+    }
+
+    const int64_t rows = ne / n;
+
+    // Choose the launch shape lazily on the current device, mirroring
+    // ggml_cuda_op_fwht. rows_per_block is picked so that consecutive rows land
+    // in different blocks; a modest value keeps the grid large enough for the
+    // memory-bound rotation while avoiding PDL (programmatic dependent launch)
+    // stalls between the buffer-level rotations that follow.
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int rows_per_block = 1;
+
+    const int64_t num_blocks = (rows + rows_per_block - 1) / rows_per_block;
+
+    dim3 grid_dims(num_blocks, 1, 1);
+    dim3 block_dims(warp_size, rows_per_block, 1);
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+
+    const float scale = 1 / sqrtf(n);
+
+    switch (n) {
+        case 64:
+            ggml_cuda_kernel_launch(fwht_cuda<64, float>, launch_params, src, dst, rows, scale);
+            return true;
+        case 128:
+            ggml_cuda_kernel_launch(fwht_cuda<128, float>, launch_params, src, dst, rows, scale);
+            return true;
+        case 256:
+            ggml_cuda_kernel_launch(fwht_cuda<256, float>, launch_params, src, dst, rows, scale);
+            return true;
+        case 512:
+            ggml_cuda_kernel_launch(fwht_cuda<512, float>, launch_params, src, dst, rows, scale);
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_cuda_ar_fwht_forward(cudaStream_t stream, float * dst, const float * src, int64_t ne) {
+    return ggml_cuda_ar_fwht_rotation(stream, dst, src, ne);
+}
+
+bool ggml_cuda_ar_fwht_inverse(cudaStream_t stream, float * dst, const float * src, int64_t ne) {
+    return ggml_cuda_ar_fwht_rotation(stream, dst, src, ne);
+}
+
 template <typename T>
 static bool ggml_cuda_op_fwht_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
     const int     n    = src->ne[0];
