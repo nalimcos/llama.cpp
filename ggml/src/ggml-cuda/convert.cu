@@ -1,9 +1,44 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
 
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
 
 #define CUDA_Q8_0_NE_ALIGN 2048
+
+// GGML_CUDA_DEQ_WIDE (launch-config knob, results bitwise identical both ways):
+// packs multiple independent super-block jobs per CUDA block for the quant -> f32/f16
+// dequant kernels used e.g. by the cuBLAS MUL_MAT fallback.  On pre-Pascal NVIDIA GPUs
+// (e.g. sm_50) the legacy 32-thread blocks cap residency at 32 blocks x 32 threads =
+// 1024 threads/SM (50%); 64-thread blocks reach 2048.  Per-thread lane math and all
+// arithmetic are unchanged: every output element is computed exactly once by the same
+// dequantize_<t> helper with the same expression sequence, so outputs are bitwise
+// identical to the legacy launch.  Only applied where measured faster on sm_50
+// (m=11008, k=4096; see bench_logs/mmq_audit.md); re-validate per arch before use.
+// unset or any other value -> packed; an explicit off-string ("0","false","no","off",
+// case-insensitive) reverts to the legacy launch config, byte-identical to before.
+static bool ggml_cuda_deq_wide_enabled() {
+    static int mode = -1;
+    if (mode < 0) {
+        const char * env = getenv("GGML_CUDA_DEQ_WIDE");
+        bool on = true;
+        if (env != nullptr) {
+            for (const char * off : { "0", "false", "no", "off" }) {
+                // Case-insensitive match -> OFF.  Any other present value -> ON.
+                bool off_match = true;
+                for (const char *a = env, *b = off; ; ++a, ++b) {
+                    const char ca = (char) std::tolower((unsigned char) *a);
+                    if (ca != *b) { off_match = false; break; }
+                    if (*b == '\0') break;
+                }
+                if (off_match) { on = false; break; }
+            }
+        }
+        mode = on ? 1 : 0;
+    }
+    return mode == 1;
+}
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y,
@@ -38,6 +73,62 @@ static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __
             y[iy0 + y_offset] = ggml_cuda_cast<dst_t>(v.y);
         }
     }
+}
+
+// wide: 4 values per thread (2 dequantize calls) instead of 2, same grid layout halved;
+// per-element math identical, ILP doubled (independent float2 chains)
+template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
+static __global__ void dequantize_block_wide(const void * __restrict__ vx, dst_t * __restrict__ y,
+        const int64_t ne00, const int64_t ne01,
+        const int64_t ne0203, const uint3 ne02,
+        const int64_t s01, const int64_t s02, const int64_t s03) {
+    const int64_t i00 = 4 * (int64_t(blockDim.x)*blockIdx.x + threadIdx.x);
+
+    if (i00 >= ne00) {
+        return;
+    }
+
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+            const uint2 dm = fast_div_modulo((uint32_t)i0203, ne02);
+            const int64_t i02 = dm.y;
+            const int64_t i03 = dm.x;
+
+            const int64_t ibx0 = i03*s03 + i02*s02 + i01*s01;
+
+            const int64_t y_offset = qr == 1 ? 1 : qk/2;
+
+            for (int p = 0; p < 2; ++p) {
+                const int64_t i00p = i00 + 2*p;
+                if (i00p >= ne00) {
+                    break;
+                }
+                const int64_t ib = ibx0 + i00p/qk; // block index
+                const int64_t iqs = (i00p%qk)/qr; // quant index
+                const int64_t iybs = i00p - i00p%qk; // y block start index
+
+                float2 v;
+                dequantize_kernel(vx, ib, iqs, v);
+
+                const int64_t iy0 = (i0203*ne01 + i01)*ne00 + iybs + iqs;
+                y[iy0 + 0]        = ggml_cuda_cast<dst_t>(v.x);
+                y[iy0 + y_offset] = ggml_cuda_cast<dst_t>(v.y);
+            }
+        }
+    }
+}
+
+// wide: 2 independent super-block jobs per CUDA block, calling the same per-thread
+// dequantize helper (which assumes TPB threads per job) -> per-element arithmetic and
+// helper lane math unchanged, outputs bitwise identical; doubles block width for
+// occupancy (pre-Pascal max 32 blocks/SM)
+template<typename dst_t, int TPB, void (*F)(const void *, int64_t, dst_t *, int)>
+static __global__ void dequantize_block_packed(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb) {
+    const int64_t i = 2*int64_t(blockIdx.x) + threadIdx.x/TPB; // blockDim.x == 2*TPB
+    if (i >= nb) {
+        return;
+    }
+    F(vx, i, yy + i*QK_K, threadIdx.x % TPB);
 }
 
 template <bool need_check>
@@ -249,6 +340,15 @@ static void dequantize_block_cuda(const void * vx, dst_t * y,
         const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
     const int64_t ne0203 = ne02*ne03;
     const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    // measured on sm_50 (m=11008, k=4096, n=256): the 4-values-per-thread variant is ~25%
+    // faster for the qr==2 types (q5_0/q5_1) and neutral-to-worse for qr==1 (q8_0), which
+    // therefore keep the legacy launch byte-identical (see bench_logs/mmq_audit.md).
+    if (ggml_cuda_deq_wide_enabled() && qr == 2) {
+        const dim3 num_blocks((ne00 + 4*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (4*CUDA_DEQUANTIZE_BLOCK_SIZE), (int)std::min(ne01, (int64_t)65535), (int)std::min(ne0203, (int64_t)65535));
+        dequantize_block_wide<qk, qr, dequantize_kernel><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>
+            (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+        return;
+    }
     const dim3 num_blocks((ne00 + 2*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (2*CUDA_DEQUANTIZE_BLOCK_SIZE), (int)std::min(ne01, (int64_t)65535), (int)std::min(ne0203, (int64_t)65535));
     dequantize_block<qk, qr, dequantize_kernel><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>
         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
@@ -305,6 +405,10 @@ static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k
 template<typename dst_t>
 static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (ggml_cuda_deq_wide_enabled()) {
+        dequantize_block_packed<dst_t, 64, &dequantize_q5_K<dst_t>><<<(nb + 1)/2, 128, 0, stream>>>(vx, y, nb);
+        return;
+    }
     dequantize_block_q5_K<<<nb, 64, 0, stream>>>(vx, y);
 }
 
