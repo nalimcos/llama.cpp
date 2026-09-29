@@ -355,8 +355,9 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
 
     if (model != nullptr) {
         model->arch = arch;
-        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llm_arch_supports_sm_tensor(arch)) {
-            throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
+        if ((params.split_mode == LLAMA_SPLIT_MODE_TENSOR || params.split_mode == LLAMA_SPLIT_MODE_LAYER_TENSOR) &&
+            !llm_arch_supports_sm_tensor(arch)) {
+            throw std::runtime_error(std::string("tensor split mode not implemented for architecture '") + llm_arch_name(arch) + "'");
         }
     }
 
@@ -1272,6 +1273,9 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
 }
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    if (params.split_mode == LLAMA_SPLIT_MODE_LAYER_TENSOR && params.tensor_split != nullptr) {
+        throw std::runtime_error("tensor_split is not supported with LLAMA_SPLIT_MODE_LAYER_TENSOR");
+    }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -2860,6 +2864,7 @@ llama_model_params llama_model_default_params() {
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
+        /*.tensor_group_size           =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,

@@ -143,7 +143,9 @@ struct llama_model_loader {
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+            // meta devices share the same buffer type name, so disambiguate by pointer
+            const int cmp = strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs));
+            return cmp != 0 ? cmp < 0 : lhs < rhs;
         }
     };
 

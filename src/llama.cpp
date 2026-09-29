@@ -154,8 +154,59 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
+// build G = n_devs/group_size meta devices with stride grouping:
+// group g = { devs[g + j*G] : j = 0..S-1 }
+// returns true on success
+static bool llama_make_layer_tensor_meta_devices(
+        const std::vector<ggml_backend_dev_t> & devs,
+        int32_t group_size,
+        llama_model * model,
+        std::vector<llama_device> & result) {
+    const size_t n_devs = devs.size();
+    const size_t S = (size_t) group_size;
+
+    if (group_size < 2) {
+        LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_LAYER_TENSOR needs a tensor group size >= 2 (got %d); use -sm layer for a pure layer split\n", __func__, group_size);
+        return false;
+    }
+    if (n_devs == 0 || n_devs % S != 0) {
+        LLAMA_LOG_ERROR("%s: number of devices (%zu) is not divisible by the tensor group size (%d)\n", __func__, n_devs, group_size);
+        return false;
+    }
+    const size_t G = n_devs / S;
+    if (G < 2) {
+        LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_LAYER_TENSOR needs at least 2 groups (got %zu with %zu devices and group size %d); use -sm tensor for a pure tensor split\n", __func__, G, n_devs, group_size);
+        return false;
+    }
+
+    // note: all groups are uniform (same S), so a single shared userdata is correct
+    model->get_split_state_ud.n_devices = S;
+    model->get_split_state_ud.model     = model;
+
+    for (size_t g = 0; g < G; ++g) {
+        std::vector<ggml_backend_dev_t> group_devs;
+        group_devs.reserve(S);
+        for (size_t j = 0; j < S; ++j) {
+            group_devs.push_back(devs[g + j*G]);
+        }
+        LLAMA_LOG_INFO("%s: creating a Meta device for tensor group %zu from %zu devices:\n", __func__, g, S);
+        for (size_t i = 0; i < S; ++i) {
+            LLAMA_LOG_INFO("%s: - device %zu: %s (%s)\n", __func__, i, ggml_backend_dev_name(group_devs[i]), ggml_backend_dev_description(group_devs[i]));
+        }
+        result.push_back({
+            true, ggml_backend_meta_device(
+            group_devs.data(), S, llama_meta_device_get_split_state, &model->get_split_state_ud)
+        });
+    }
+    return true;
+}
+
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    if (params.split_mode == LLAMA_SPLIT_MODE_LAYER_TENSOR && params.main_gpu != 0) {
+        LLAMA_LOG_WARN("%s: main_gpu is ignored with LLAMA_SPLIT_MODE_LAYER_TENSOR\n", __func__);
+    }
+
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -177,6 +228,14 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 true, ggml_backend_meta_device(
                 params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
             });
+        } else if (params.split_mode == LLAMA_SPLIT_MODE_LAYER_TENSOR) {
+            std::vector<ggml_backend_dev_t> devs;
+            for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
+                devs.push_back(*dev);
+            }
+            if (!llama_make_layer_tensor_meta_devices(devs, params.tensor_group_size, model, model->devices)) {
+                return false;
+            }
         } else {
             for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
                 model->devices.push_back({false, *dev});
@@ -218,6 +277,20 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 true, ggml_backend_meta_device(
                 devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
             });
+        } else if (params.split_mode == LLAMA_SPLIT_MODE_LAYER_TENSOR) {
+            std::vector<ggml_backend_dev_t> devs;
+            devs.reserve(ggml_backend_dev_count());
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                auto * dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
+                    LLAMA_LOG_INFO("%s: skipping %s (%s) for tensor parallelism\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+                    continue;
+                }
+                devs.push_back(dev);
+            }
+            if (!llama_make_layer_tensor_meta_devices(devs, params.tensor_group_size, model, gpus)) {
+                return false;
+            }
         } else {
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);

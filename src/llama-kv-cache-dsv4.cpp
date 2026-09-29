@@ -910,7 +910,9 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
 
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+            // meta devices share the same buffer type name, so disambiguate by pointer
+            const int cmp = strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs));
+            return cmp != 0 ? cmp < 0 : lhs < rhs;
         }
     };
 

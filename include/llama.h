@@ -201,6 +201,7 @@ extern "C" {
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
         LLAMA_SPLIT_MODE_ROW    = 2, // split layers and KV across GPUs, use tensor parallelism if supported
         LLAMA_SPLIT_MODE_TENSOR = 3,
+        LLAMA_SPLIT_MODE_LAYER_TENSOR = 4, // split layers across groups of devices, tensor split within each group
     };
 
     enum llama_load_mode {
@@ -331,6 +332,9 @@ extern "C" {
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
+
+        // devices per tensor-parallel group for LLAMA_SPLIT_MODE_LAYER_TENSOR (0 = unset)
+        int32_t tensor_group_size;
 
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
