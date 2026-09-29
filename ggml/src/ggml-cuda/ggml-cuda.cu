@@ -354,6 +354,14 @@ static ggml_cuda_device_info ggml_cuda_init() {
             turing_devices_without_mma.push_back({ id, device_name });
         }
 
+        CUDA_CHECK(cudaSetDevice(id));
+        // experimental: GGML_CUDA_SPIN_WAIT trades CPU for lower sync/wake latency
+        if (getenv("GGML_CUDA_SPIN_WAIT") != nullptr) {
+            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
+        } else {
+            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+        }
+
         // Temporary performance fix:
         // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
         // TODO: Check for future drivers the default scheduling strategy and

@@ -168,7 +168,12 @@ static __global__ void ggml_cuda_ar_kernel(
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
             __nanosleep(100);
 #else
-            NO_DEVICE_CODE;
+            // Pre-Volta (e.g. Maxwell) has no __nanosleep.  Burn a few
+            // hundred cycles between polls so the spinning thread does not
+            // hammer the PCIe reads of the host flag at full rate.
+            const long long backoff_start = clock64();
+            while (clock64() - backoff_start < 256) {
+            }
 #endif // GGML_USE_HIP
         }
     }
@@ -405,17 +410,9 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         return nullptr;
     }
 
-    // The chunked kernel uses __nanosleep (NVIDIA, sm70+) or
-    // __builtin_amdgcn_s_sleep (AMD).
-    for (size_t i = 0; i < n_devices; ++i) {
-        const int cc = ggml_cuda_info().devices[devices[i]].cc;
-        if (cc < GGML_CUDA_CC_VOLTA) {
-            GGML_LOG_DEBUG("%s: internal AllReduce requires compute capability >= %d "
-                           "(device %d has cc=%d); falling back\n",
-                           __func__, GGML_CUDA_CC_VOLTA, devices[i], cc);
-            return nullptr;
-        }
-    }
+    // The chunked kernel's spin-wait uses __nanosleep on Volta+ and a
+    // clock64()-based backoff loop on older architectures (e.g. Maxwell), so
+    // there is no compute-capability restriction.
 
     auto * p = new ggml_cuda_ar_pipeline{};
     p->n_devices        = n_devices;
@@ -429,10 +426,19 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                       __func__, p->copy_chunk_bytes, GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN);
         p->copy_chunk_bytes = GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN;
     }
-    // Default 1: BF16 round-trip is always on for F32 inputs (any non-zero
-    // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
-    // byte threshold to opt out for small tensors.
-    p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    // GGML_CUDA_AR_BF16_THRESHOLD: byte threshold on the F32 input tensor
+    // size at or above which the reduction is performed via an FP32->BF16
+    // round-trip (halving on-wire bytes).  Semantics:
+    //   0        = disabled; FP32 wire for all tensors (max. numerics).
+    //   N > 0    = BF16 wire only for F32 tensors with nbytes >= N; smaller
+    //              tensors keep the FP32 wire.
+    // Default 131072 (128 KiB): small (e.g. token-generation) reductions are
+    // latency-bound, so they keep the numerically safe FP32 wire, while large
+    // (e.g. prompt-processing) reductions are bandwidth-bound and benefit
+    // from halved on-wire bytes.  This mirrors the NCCL path's heuristic
+    // (FP32 for small tensors, BF16 for large).  Use 1 for BF16 everywhere,
+    // or a huge value (e.g. 2e9) for FP32 everywhere.
+    p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 131072);
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }

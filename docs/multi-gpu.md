@@ -113,6 +113,31 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs) 
 
 ---
 
+## Slow PCIe / no-P2P systems
+
+On systems where GPUs are attached via narrow PCIe links (e.g. x1 mining-style risers) and peer-to-peer access is unavailable, cross-GPU reductions are staged through host memory and the choice of reduction backend matters:
+
+- `GGML_CUDA_ALLREDUCE={nccl|internal|none}` - selects the cross-GPU reduction backend used by tensor-parallel modes (`tensor`, `layer-tensor`). Default: `nccl` on Linux, `internal` elsewhere.
+  - `nccl`: use NCCL (requires a build with NCCL support).
+  - `internal`: llama.cpp's own all-reduce, staged through pinned host memory when P2P is unavailable. Supports 2-GPU groups and works on Maxwell (compute capability 5.0) and newer. On host-staged PCIe systems it can beat NCCL, so it is worth benchmarking both.
+  - `none`: disable collective reductions (fallback path, slowest).
+- `GGML_CUDA_AR_COPY_THRESHOLD` - internal all-reduce: tensors of this size **in bytes or larger** use the copy-engine path (chunked D2H/H2D copies overlapped via events); smaller tensors use the kernel path. `0` disables the copy-engine path. Default: 1048576 (1 MiB).
+- `GGML_CUDA_AR_BF16_THRESHOLD` - internal all-reduce: F32 tensors of this size **in bytes or larger** are reduced over a BF16 wire (halving on-wire bytes); smaller tensors keep the numerically safe F32 wire. `0` disables the BF16 wire entirely. Default: 131072 (128 KiB). Use `1` for BF16 everywhere, or a huge value for F32 everywhere.
+- `GGML_CUDA_SPIN_WAIT` - CUDA device synchronization waits with blocking-sync by default (lower CPU usage; this changes the CUDA runtime's default auto/spin behavior) - set to any value to restore spin-waiting for lower sync/wake latency at the cost of busy-waiting CPU.
+
+### Worked example: 2 boards × 4 GPUs on PCIe x1
+
+For a rig with 8 GPUs on 2 boards of 4 (no P2P, narrow per-board host links), pair GPUs across the boards for tensor parallelism and pipeline the layers across the pairs:
+
+```bash
+GGML_CUDA_ALLREDUCE=internal \
+llama-cli -m model.gguf -ngl 99 -sm layer-tensor -tgs 2 -fa 1 -ctk f16 -ctv f16 ...
+```
+
+This creates 4 tensor-parallel groups of 2 GPUs ({0,4}, {1,5}, {2,6}, {3,7} with the default enumeration), each spanning both boards' host links, with layers pipelined across the 4 groups.
+
+---
+
 ## Troubleshooting
 
 | Symptom | How to fix |
