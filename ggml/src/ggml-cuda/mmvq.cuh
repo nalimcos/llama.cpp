@@ -2,6 +2,12 @@
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 
+// On Maxwell (cc 5.x) there is no dp4a/MMQ/MMF, so quantized MUL_MAT_ID otherwise falls back to a
+// synchronizing host sort + per-expert cuBLAS GEMMs that also disables CUDA graphs for the whole graph.
+// For n_tokens in (MMVQ_MAX_BATCH_SIZE, MMVQ_MOE_CHUNK_MAX_BATCH] run the fused MMVQ MoE kernel in
+// per-type token chunks (get_mmvq_mmid_max_batch) instead: no host sync and CUDA-graph eligible.
+#define MMVQ_MOE_CHUNK_MAX_BATCH 128
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,

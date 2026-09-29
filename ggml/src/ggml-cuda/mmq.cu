@@ -3,7 +3,9 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <cctype>
 #include <cstdint>
+#include <cstdlib>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
@@ -375,7 +377,71 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
         // for MoE, mmq is faster even without native dp4a
         // TODO: check if cards older than pascal might benefit from this as well
-        return cc >= GGML_CUDA_CC_PASCAL && n_experts > 0;
+        if (cc >= GGML_CUDA_CC_PASCAL && n_experts > 0) {
+            return true;
+        }
+
+        // Pre-DP4A NVIDIA GPUs run MMQ with an emulated (exact-integer) dp4a. Measured on Tesla M10
+        // (sm_50, pascal MMQ tile config, m=11008, k=1024/4096, op-level incl. y-quantization):
+        // MMQ beats the stock dequant + cuBLAS SGEMM path only for SMALL batches, with a per-type
+        // cutoff -- MMQ loses to SGEMM from n=256 on for every type (SGEMM is FFMA-bound at ~92% of
+        // fp32 peak while emulated dp4a costs ~4 integer ops per 4 MACs), and tile retuning
+        // (I/J=128, nthreads=512) only made it worse (occupancy/spills). Measured winners:
+        //   n <= 128: q4_0, q4_1, iq1_s, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_nl, iq4_xs
+        //   n <=  64: q5_0, q5_1, q8_0, q3_K
+        //   n <=  32: q4_K
+        //   never:    q2_K, q5_K, q6_K (and all non-MMQ types)
+        // Default OFF (any present GGML_CUDA_MMQ_SM50 value opts in, except explicit off-strings
+        // "0","false","no","off" case-insensitive): the win is 5-25% at n<=128 (up to 2.4x at
+        // n=32) and matters for unbatched/agentic prefill, but it changes results vs the SGEMM path
+        // (as MMQ does on every other arch) and the production ubatch (n=256) is a loss.
+        static const bool mmq_sm50 = []() {
+            const char * env = getenv("GGML_CUDA_MMQ_SM50");
+            if (env == nullptr) {
+                return false;
+            }
+            for (const char * off : { "0", "false", "no", "off" }) {
+                // Case-insensitive match -> OFF.  Any other present value -> ON.
+                bool off_match = true;
+                for (const char *a = env, *b = off; ; ++a, ++b) {
+                    const char ca = (char) std::tolower((unsigned char) *a);
+                    if (ca != *b) { off_match = false; break; }
+                    if (*b == '\0') break;
+                }
+                if (off_match) { return false; }
+            }
+            return true;
+        }();
+        if (!mmq_sm50) {
+            return false;
+        }
+        int64_t ne11_max;
+        switch (type) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_IQ1_S:
+            case GGML_TYPE_IQ2_XXS:
+            case GGML_TYPE_IQ2_XS:
+            case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_IQ3_XXS:
+            case GGML_TYPE_IQ3_S:
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_IQ4_XS:
+                ne11_max = 128;
+                break;
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q3_K:
+                ne11_max = 64;
+                break;
+            case GGML_TYPE_Q4_K:
+                ne11_max = 32;
+                break;
+            default:
+                return false;
+        }
+        return ne11 <= ne11_max;
     }
 
 #ifdef GGML_CUDA_FORCE_MMQ

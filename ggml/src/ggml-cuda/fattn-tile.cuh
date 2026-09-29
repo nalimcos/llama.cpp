@@ -94,6 +94,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40, 16, 256, 2,  32,  40)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40, 32, 256, 2,  32,  40)
 
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64,  1, 128, 3, 128,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64,  2, 128, 3,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64,  4, 128, 3,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 64,  64,  8, 128, 3,  32,  64)
@@ -124,6 +125,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112, 16, 256, 2,  32,  56)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(112, 112, 32, 256, 2,  32,  56)
 
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  1, 128, 3, 128, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  2, 128, 3,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  4, 128, 3,  32, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  8, 128, 3,  64, 128)
@@ -1219,6 +1221,23 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             return;
         }
     }
+
+    // ncols=1 config only defined for the NVIDIA FP32 path (Maxwell).
+    // On Maxwell (cc 5.x) decode (1 Q column) otherwise falls back to 2 columns / block, wasting half of the KQ FLOPs.
+#if !defined(GGML_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 500 && __CUDA_ARCH__ < GGML_CUDA_CC_PASCAL
+    if constexpr (ncols2 == 1 && (DKQ == 64 || DKQ == 128) && DV == DKQ) {
+        if (Q->ne[1] == 1) {
+            constexpr int cols_per_block = 1;
+            const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
+            launch_fattn<DV, cols_per_block/ncols2, ncols2>
+                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, warp_size);
+            return;
+        }
+    }
+#endif
 
     if constexpr (ncols2 <= 2) {
         constexpr int cols_per_block = 2;
