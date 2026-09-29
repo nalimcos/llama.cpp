@@ -440,6 +440,17 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
 #define GGML_MMVQ_MOE_RPB_MAXWELL 8
 #endif
 
+// The two Maxwell variants differ in shared memory per SM (sm_50/GM107: 64 KiB, sm_52/GM204: 96 KiB),
+// so they want different decode launches. sm_50 uses the sm_50-tuned tiled n=1 decode path
+// (mmvq_tiled_rows_per_block, nwarps=2); sm_52 keeps the MMVQ_PARAMETERS_MAXWELL table tuning.
+// Selected at configure time from the CUDA arch list (GGML_CUDA_MAXWELL_* in CMakeLists.txt);
+// in a build targeting both variants the per-device cc picks the right one.
+#ifdef GGML_CUDA_MAXWELL_GM107
+#define GGML_MMVQ_MAXWELL_SM50_TILED_N1 1
+#else
+#define GGML_MMVQ_MAXWELL_SM50_TILED_N1 0
+#endif
+
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
 template <ggml_type type>
 static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
@@ -1402,7 +1413,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream);
             };
 
-            const bool tiled = tiled_rows > 0 && !should_use_small_k(c_ncols_dst) && table_id == MMVQ_PARAMETERS_GENERIC && mmvq_tiled_mode() == 1;
+            const bool maxwell_sm50 = GGML_MMVQ_MAXWELL_SM50_TILED_N1 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc < 520;
+            const bool tiled = tiled_rows > 0 && !should_use_small_k(c_ncols_dst) &&
+                (table_id == MMVQ_PARAMETERS_GENERIC || (table_id == MMVQ_PARAMETERS_MAXWELL && maxwell_sm50)) &&
+                mmvq_tiled_mode() == 1;
             if (tiled) {
                 if constexpr (tiled_rows > 0) {
                     const dim3 block_nums((nrows_x + tiled_rows - 1) / tiled_rows, nchannels_dst, nsamples_dst);

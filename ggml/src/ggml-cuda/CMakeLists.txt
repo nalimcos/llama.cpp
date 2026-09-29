@@ -112,6 +112,23 @@ if (CUDAToolkit_FOUND)
     endif()
     message(STATUS "Using CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES} CMAKE_CUDA_ARCHITECTURES_NATIVE=${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
 
+    # Maxwell exists in two variants that differ in shared memory per SM, which the kernel tuning
+    # depends on: sm_50 = GM107 = 64 KiB, sm_52 = GM204 = 96 KiB.
+    set(GGML_CUDA_MAXWELL_VARIANTS "")
+    foreach(GGML_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        string(REGEX REPLACE "(-real|-virtual)$" "" GGML_CUDA_ARCH_NUM "${GGML_CUDA_ARCH}")
+        if (GGML_CUDA_ARCH_NUM STREQUAL "50")
+            list(APPEND GGML_CUDA_MAXWELL_VARIANTS "GM107 (sm_50, 64 KiB shared memory)")
+            add_compile_definitions(GGML_CUDA_MAXWELL_GM107)
+        elseif (GGML_CUDA_ARCH_NUM STREQUAL "52")
+            list(APPEND GGML_CUDA_MAXWELL_VARIANTS "GM204 (sm_52, 96 KiB shared memory)")
+            add_compile_definitions(GGML_CUDA_MAXWELL_GM204)
+        endif()
+    endforeach()
+    if (GGML_CUDA_MAXWELL_VARIANTS)
+        message(STATUS "Using Maxwell variant(s): ${GGML_CUDA_MAXWELL_VARIANTS}")
+    endif()
+
     file(GLOB   GGML_HEADERS_CUDA "*.cuh")
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
