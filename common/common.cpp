@@ -1615,6 +1615,15 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
+    mparams.tensor_group_size = params.tensor_group_size;
+
+    if (params.split_mode == LLAMA_SPLIT_MODE_LAYER_TENSOR &&
+        std::all_of(params.tensor_split, params.tensor_split + llama_max_devices(), [](float v) { return v == 0.0f; })) {
+        // tensor_split is not supported with layer-tensor split; clear the pointer if the
+        // user did not set it so that the model does not reject the default zeroed array.
+        // a user-provided tensor_split is passed through and rejected by the model.
+        mparams.tensor_split = nullptr;
+    }
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;

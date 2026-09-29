@@ -2801,12 +2801,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
-        {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
+        {"-sm", "--split-mode"}, "{none,layer,row,tensor,layer-tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
         "- layer (default): split layers and KV across GPUs (pipelined)\n"
         "- row: split weight across GPUs by rows (parallelized)\n"
-        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)",
+        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)\n"
+        "- layer-tensor: layer split across groups of GPUs, tensor split within each group; use with --tensor-group-size",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;
@@ -2816,6 +2817,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.split_mode = LLAMA_SPLIT_MODE_ROW;
             } else if (value == "tensor") {
                 params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            } else if (value == "layer-tensor") {
+                params.split_mode = LLAMA_SPLIT_MODE_LAYER_TENSOR;
             } else {
                 throw std::invalid_argument("invalid value");
             }
@@ -2824,6 +2827,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
+    add_opt(common_arg(
+        {"-tgs", "--tensor-group-size"}, "N",
+        "number of GPUs per tensor-parallel group when --split-mode layer-tensor is used; "
+        "groups are formed by striding the visible device list (group g = devices g, g+G, g+2G, ...)",
+        [](common_params & params, int value) { params.tensor_group_size = value; }
+    ).set_env("LLAMA_ARG_TENSOR_GROUP_SIZE"));
     add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
