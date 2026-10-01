@@ -167,6 +167,24 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
         case GGML_TYPE_IQ4_XS:  return 5;
         case GGML_TYPE_MXFP4:   return 4;
         case GGML_TYPE_NVFP4:   return 4;
+        case GGML_TYPE_Q2_K:    return 4;
+        case GGML_TYPE_Q3_K:    return 4;
+        case GGML_TYPE_Q4_0:    return 6;
+        case GGML_TYPE_Q4_1:    return 6;
+        case GGML_TYPE_Q4_K:    return 5;
+        case GGML_TYPE_Q5_0:    return 6;
+        case GGML_TYPE_Q5_1:    return 6;
+        case GGML_TYPE_Q5_K:    return 5;
+        case GGML_TYPE_Q6_K:    return 4;
+        case GGML_TYPE_Q8_0:    return 4;
+        default:                return MMVQ_MAX_BATCH_SIZE;
+    }
+}
+
+// Maxwell (cc 5.x) overrides: the fused MoE kernel beats the synchronizing fallback up to
+// MMVQ_MAX_BATCH_SIZE for every K-quant measured on the Tesla M40, unlike for Pascal.
+static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_maxwell(ggml_type type) {
+    switch (type) {
         case GGML_TYPE_Q2_K:    return 8;
         case GGML_TYPE_Q3_K:    return 8;
         case GGML_TYPE_Q4_0:    return 8;
@@ -177,7 +195,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
         case GGML_TYPE_Q5_K:    return 8;
         case GGML_TYPE_Q6_K:    return 8;
         case GGML_TYPE_Q8_0:    return 8;
-        default:                return MMVQ_MAX_BATCH_SIZE;
+        default:                return get_mmvq_mmid_max_batch_pascal_older(type);
     }
 }
 
@@ -297,6 +315,9 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
         }
         if (cc >= GGML_CUDA_CC_TURING) {
             return get_mmvq_mmid_max_batch_turing_plus(type);
+        }
+        if (cc >= 500 && cc < GGML_CUDA_CC_PASCAL) {
+            return get_mmvq_mmid_max_batch_maxwell(type);
         }
         return get_mmvq_mmid_max_batch_pascal_older(type);
     }
@@ -468,6 +489,8 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
     return MMVQ_MAX_BATCH_SIZE;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
     return get_mmvq_mmid_max_batch_turing_plus(type);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 500 && __CUDA_ARCH__ < GGML_CUDA_CC_PASCAL
+    return get_mmvq_mmid_max_batch_maxwell(type);
 #else
     return get_mmvq_mmid_max_batch_pascal_older(type);
 #endif
