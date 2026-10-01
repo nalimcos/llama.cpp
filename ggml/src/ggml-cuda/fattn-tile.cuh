@@ -1224,11 +1224,10 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
 
     // ncols=1 config only defined for the NVIDIA FP32 path (Maxwell).
     // On Maxwell (cc 5.x) decode (1 Q column) otherwise falls back to 2 columns / block, wasting half of the KQ FLOPs.
-#if !defined(GGML_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 500 && __CUDA_ARCH__ < GGML_CUDA_CC_PASCAL
+#ifndef GGML_USE_HIP
     if constexpr (ncols2 == 1 && (DKQ == 64 || DKQ == 128) && DV == DKQ) {
-        if (Q->ne[1] == 1) {
+        if (cc >= 500 && cc < GGML_CUDA_CC_PASCAL && Q->ne[1] == 1) {
             constexpr int cols_per_block = 1;
-            const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap>;
