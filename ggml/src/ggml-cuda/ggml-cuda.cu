@@ -2233,12 +2233,14 @@ static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
 // ---------------------------------------------------------------------------
 static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * ret) {
     ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
+    GGML_LOG_INFO("ggml_cuda_allreduce: using butterfly (meta-backend)\n");
 }
 
 static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context * ret) {
     ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
     if (ret->ar_pipeline) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
+        GGML_LOG_INFO("ggml_cuda_allreduce: using internal (in-tree 2-GPU) AllReduce\n");
         return;
     }
 
@@ -2265,6 +2267,7 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
     if (rc == ncclSuccess) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+        GGML_LOG_INFO("ggml_cuda_allreduce: using NCCL\n");
         return;
     }
 
@@ -2281,10 +2284,28 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ggml_backend_cuda_comm_init_internal(ret);
 }
 
-// Top-level init.  Picks one of the three init paths based on
-// GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
-// any fallback.  Unrecognised env values warn and fall through to the
-// platform default.
+// True if any pair of the participating devices can do peer (P2P) transfers.
+// NCCL is only worth using when this holds: without P2P it stages every
+// reduction through host memory, where the in-tree reducer is at least as fast.
+static bool ggml_backend_cuda_comm_devices_have_p2p(const std::vector<int> & dev_ids) {
+    for (size_t i = 0; i < dev_ids.size(); ++i) {
+        for (size_t j = i + 1; j < dev_ids.size(); ++j) {
+            int can_access_peer = 0;
+            (void) cudaDeviceCanAccessPeer(&can_access_peer, dev_ids[i], dev_ids[j]);
+            if (can_access_peer) {
+                return true;
+            }
+        }
+    }
+    (void) cudaGetLastError(); // clear any sticky error from the queries
+    return false;
+}
+
+// Top-level init.  GGML_CUDA_ALLREDUCE (nccl|internal|none) is the explicit
+// override and wins when set.  Otherwise, if the participating devices have no
+// P2P pair, use the in-tree reducer (internal for a 2-device group, butterfly
+// otherwise); with P2P, use NCCL on Linux and internal elsewhere.  The chain
+// in each init step handles any further fallback.
 static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
     for (size_t i = 0; i < n_backends; i++) {
         if (!ggml_backend_is_cuda(backends[i])) {
@@ -2300,14 +2321,7 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     }
 
     const char * env = getenv("GGML_CUDA_ALLREDUCE");
-    if (!env) {
-        // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
-#if defined(__linux__)
-        ggml_backend_cuda_comm_init_nccl(ret);
-#else
-        ggml_backend_cuda_comm_init_internal(ret);
-#endif // defined(__linux__)
-    } else {
+    if (env) {
         std::string env_str(env);
         if (env_str == "nccl") {
             ggml_backend_cuda_comm_init_nccl(ret);
@@ -2319,6 +2333,19 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
             GGML_LOG_WARN("unknown GGML_CUDA_ALLREDUCE value: %s\n", env);
             ggml_backend_cuda_comm_init_none(ret);
         }
+    } else if (!ggml_backend_cuda_comm_devices_have_p2p(ret->dev_ids)) {
+        if (ret->dev_ids.size() == 2) {
+            ggml_backend_cuda_comm_init_internal(ret);
+        } else {
+            ggml_backend_cuda_comm_init_none(ret);
+        }
+    } else {
+        // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
+#if defined(__linux__)
+        ggml_backend_cuda_comm_init_nccl(ret);
+#else
+        ggml_backend_cuda_comm_init_internal(ret);
+#endif // defined(__linux__)
     }
 
     return ret;
