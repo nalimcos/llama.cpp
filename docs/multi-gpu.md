@@ -1,179 +1,132 @@
 # Using multiple GPUs with llama.cpp
 
-This guide explains how to run [llama.cpp](https://github.com/ggml-org/llama.cpp) across more than one GPU. It covers the split modes, the command-line flags that control them, the limitations you need to know about, and ready-to-use recipes for `llama-cli` and `llama-server`.
-
-The CLI arguments listed here are the same for both tools - or most llama.cpp binaries for that matter.
+This guide covers llama.cpp's split modes, the flags that control them, and the cross-GPU AllReduce backends. The arguments are the same for `llama-cli`, `llama-server`, and the other tools.
 
 ---
 
-## When you need multi-GPU
-
-Reach for multi-GPU when one of these is true:
-
-- **The model doesn't fit in a single GPU's VRAM.** By spreading the weights across two or more GPUs the whole model can stay on accelerators. Otherwise part of the model will need to be run off of the comparatively slower system RAM.
-- **You want more throughput.** By distributing the computation across multiple GPUs, each individual GPU has to do less work. This can result in better prefill and/or token generation performance, depending on the split mode and interconnect speed vs. the speed of an individual GPU.
-
----
-
-## The split modes
+## Split modes
 
 Set with `--split-mode` / `-sm`.
 
-| Mode | What it does | When to use |
-|---|---|---|
-| `none` | Use a single GPU only. Pick which one with `--main-gpu`. | You explicitly want to confine the model to one GPU even though more are visible. |
-| `layer` (**default**) | Pipeline parallelism. Each GPU holds a contiguous slice of layers. The KV cache for layer *l* lives on the GPU that owns layer *l*. | Default and most compatible multi-GPU choice. You want more memory than a single GPU provides and your priority is a fast prefill. Can tolerate slow interconnect speeds between GPUs. |
-| `row` | **Deprecated.** Older row-split tensor-parallel path with comparatively poor performance. Splits only dense weights across GPUs. Superseded by `tensor` which should be universally superior if it can be used. | Avoid in new deployments. |
-| `tensor` | **EXPERIMENTAL.** Tensor parallelism that splits both weights *and* KV across the participating GPUs via a "meta device" abstraction. | You want more memory than a single GPU provides and your priority is fast token generation. Prefill speeds approach pipeline parallel speeds for large, dense models and fast GPU interconnect speeds. Treat as experimental as the code is less mature than pipeline parallelism. Performance should be good for multiple NVIDIA GPUs using the CUDA backend, no guarantees otherwise. |
-| `layer-tensor` | **EXPERIMENTAL.** Hierarchical split: layer (pipeline) parallelism across *groups* of GPUs, tensor parallelism *within* each group. Each group is presented to the scheduler as a "meta device". Group size is set with `--tensor-group-size`. | You have 4+ GPUs and want to limit tensor parallelism (which is interconnect-hungry) to pairs of GPUs that have the fastest link between them, while still spreading layers across all GPUs. Inherits the restrictions of `tensor` mode. |
+| Mode | What it does | Requires | Cost |
+|---|---|---|---|
+| `none` | Model on one GPU, chosen by `--main-gpu`. | one GPU | limited to that GPU's VRAM. |
+| `layer` (**default**) | Pipeline parallelism: each GPU owns a contiguous slice of layers and the KV for layer *l* stays on the GPU that owns it. No cross-GPU reductions. | nothing special | each GPU holds its own KV; token generation is bounded by the longest pipeline stage. |
+| `row` | Legacy row-split path; splits dense weights only. Superseded by both `layer` and `tensor`. | - | no reason to choose it in new deployments. |
+| `tensor` | **Experimental.** Tensor parallelism: weights and KV split across all visible GPUs via a meta device. | flash attention; unquantized KV; architecture on the tensor allow-list | one cross-GPU all-reduce per layer; interconnect-bound. |
+| `layer-tensor` | **Experimental.** Hierarchical split: `layer` across groups, `tensor` within each group. Group size set by `-tgs`. | everything `tensor` needs, plus `n_devices % tgs == 0`, `tgs >= 2`, and at least 2 groups. | reduces only within a group, so slow inter-group links are not on the reduction path. |
 
-> Pipeline parallel (`layer`) vs. tensor parallel (`tensor`): pipeline-parallel runs different layers on different GPUs and processes tokens sequentially through the pipeline. This minimizes data transfers between GPUs but requires many tokens to scale well. Tensor-parallel splits each layer across GPUs and does multiple cross-GPU reductions per layer. This enables parallelizing any workload but is much more bottlenecked by the GPU interconnect speed. Pipeline-parallel maximizes batch throughput; tensor-parallel minimizes latency.
+`tensor` and `layer-tensor` share these hard restrictions:
+
+- Flash attention must be on (`-fa 1`; `-fa auto` resolving to off is a startup error).
+- KV cache must be `f32`, `f16`, or `bf16`; quantized KV is not implemented.
+- The architecture must be on the tensor allow-list, otherwise startup fails with *"tensor split mode not implemented for architecture 'X'"*. Generally excluded: MoE / hybrid and SSM / RWKV-style architectures.
+- `--fit` is not implemented (see the flags table).
+- `--tensor-split` is rejected by `layer-tensor`.
 
 ---
 
-## Command-line arguments reference
+## Which mode to use
+
+```
+1 GPU                                                       -> -sm none
+2 GPUs, or slow / no-P2P multi-GPU                          -> the mode that gives 2-device groups:
+    exactly 2 GPUs                                             -sm tensor
+    >= 4 GPUs                                                  -sm layer-tensor -tgs 2
+fast pairwise GPU interconnect (P2P / NVLink)               -> -sm tensor
+anything else                                               -> -sm layer
+```
+
+Reasoning: with no P2P, every cross-GPU reduction is staged through host memory, so the reduction backend dominates. A 2-device group selects the in-tree `internal` reducer; groups of three or more fall back to the generic `butterfly` reducer (below). `layer` performs no cross-GPU reduction at all and is the safe fallback; on a fast link, `tensor` is the fastest.
+
+---
+
+## Flags
 
 | Short | Long | Value | Default | Notes |
 |---|---|---|---|---|
-| `-sm` | `--split-mode` | `none` \| `layer` \| `row` \| `tensor` \| `layer-tensor` | `layer` | See modes above. |
-| `-tgs` | `--tensor-group-size` | integer | `0` (unset) | Number of GPUs per tensor-parallel group in `--split-mode layer-tensor` (env `LLAMA_ARG_TENSOR_GROUP_SIZE`). Must be ≥ 2 and evenly divide the number of visible devices (`n_devices % tgs == 0`), leaving at least 2 groups. Groups are formed by striding the visible device list: group *g* = devices *g, g+G, g+2G, ...* where *G = n_devices / tgs*. All groups are uniform. |
-| `-ts` | `--tensor-split` | comma-separated proportions, e.g. `3,1` | mode-dependent | How much of the model goes to each GPU. If omitted, `layer`/`row` use automatic splitting proportional to memory, while `tensor` splits tensor segments evenly. With `3,1` on two GPUs, GPU 0 gets 75 %, GPU 1 gets 25 %. The values follow the order in `--device`. Not supported with `layer-tensor`. |
-| `-mg` | `--main-gpu` | integer device index | `0` | The single GPU used in `--split-mode none`. |
-| `-ngl` | `--n-gpu-layers` / `--gpu-layers` | integer \| `auto` \| `all` | `auto` | Maximum number of layers to keep in VRAM. Use `999` or `all` to push everything possible to the GPUs. |
-| `-dev` | `--device` | comma-separated device names, or `none` | auto | Restrict which devices llama.cpp may use. See `--list-devices` for names. |
-| | `--list-devices` | - | - | Print the available devices and their memory. Run this first to learn the names you'd pass to `--device`. |
-| `-fa` | `--flash-attn` | `on` \| `off` \| `auto` | `auto` | Required when using `--split-mode tensor` and/or quantized V cache. Supported (and therefore enabled by default) for most combinations of models and backends. |
-| `-ctk` | `--cache-type-k` | `f32` \| `f16` \| `bf16` \| `q8_0` \| `q4_0` \| ... | `f16` | KV cache type for K. |
-| `-ctv` | `--cache-type-v` | same as `-ctk` | `f16` | KV cache type for V. |
-| `-fit` | `--fit` | `on` \| `off` | `on` | Auto-fit unset args to device memory. **Not supported with `tensor` or `layer-tensor`. You may need to manually set the `--ctx-size` to make the model fit.**  |
+| `-sm` | `--split-mode` | `none`\|`layer`\|`row`\|`tensor`\|`layer-tensor` | `layer` | See above. |
+| `-tgs` | `--tensor-group-size` | integer | `0` (unset) | GPUs per tensor group in `layer-tensor` (the flag is `-tgs`, not `-tsg`). Must be `>= 2`, divide the visible device count, and leave at least 2 groups. Groups stride the device list: group *g* = devices *g, g+G, g+2G, ...* with *G = n_devices / tgs*. All groups are uniform. |
+| `-ts` | `--tensor-split` | proportions, e.g. `3,1` | mode-dependent | Per-GPU share. `layer` / `row`: memory-proportional when unset. `tensor`: sizes the in-group tensor segments; even when unset. Rejected by `layer-tensor`. |
+| `-mg` | `--main-gpu` | device index | `0` | GPU used by `-sm none`; with `row`, the GPU holding intermediate results and KV. Warned and ignored by `layer-tensor`. |
+| `-ngl` | `--gpu-layers` / `--n-gpu-layers` | integer \| `auto` \| `all` | `auto` | Layers kept in VRAM. `99` or `all` offloads everything possible. |
+| `-fa` | `--flash-attn` | `on`\|`off`\|`auto` | `auto` | Required by `tensor` / `layer-tensor`. |
+| `-ctk`, `-ctv` | `--cache-type-k` / `--cache-type-v` | `f32`\|`f16`\|`bf16`\|`q8_0`\|... | `f16` | KV cache types. |
+| `-ot` | `--override-tensor` | `pattern=buffer,...` | - | Force a tensor-name pattern onto a buffer type, e.g. keep some weights on CPU to rebalance VRAM across GPUs. |
+| `-fit` | `--fit` | `on`\|`off` | `on` | Auto-size unset arguments to device memory. Implemented only for `none` / `layer` / `row`; with `tensor` / `layer-tensor` it aborts and the model loads with the supplied/default arguments instead. Use `-fit off` to silence the warning. |
+| `-dev` | `--device` | device names, or `none` | auto | Restrict which devices llama.cpp may use; inspect with `--list-devices`. |
+| | `--list-devices` | - | - | Print devices and their memory. |
 
-As for any CUDA program, the environment variable `CUDA_VISIBLE_DEVICES` can be used to control which GPUs to use for the CUDA backend: if you set it, llama.cpp only sees the specified GPUs. Use `--device` for selecting GPUs from among those visible to llama.cpp, this works for any backend.
-
----
-
-## Recipes
-
-### 1. Default - pipeline parallel across all visible GPUs
-
-```bash
-llama-cli -m model.gguf
-llama-server -m model.gguf
-```
-
-Easiest configuration. KV cache spreads across the GPUs along with the layers. `--fit` (on by default) sizes things automatically.
-
-### 2. Pipeline parallel with a custom split ratio
-
-```bash
-llama-cli -m model.gguf -ts 3,1
-```
-
-Useful when GPUs have different memory: GPU 0 (3 parts) and GPU 1 (1 part). Proportions are normalized so `-ts 3,1` is the same as e.g. `-ts 75,25`.
-
-### 3. Single-GPU mode, picking a specific GPU
-
-```bash
-llama-cli --list-devices
-llama-cli -m model.gguf -dev CUDA1
-```
-
-Use only the device listed as `CUDA1` when calling with `--list-devices`.
-
-### 4. Tensor parallelism (experimental)
-
-```bash
-llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
-```
-
-- `--flash-attn off` or (`--flash-attn auto` resolving to `off` when it isn't supported) is a hard error.
-- KV cache types must be non-quantized: `f32`, `f16`, or `bf16`. Support for quantized KV cache is not implemented and trying to use it will result in an error.
-- Mark this configuration as experimental in your tooling: validate output quality before deploying.
-- `--split-mode tensor`is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"*:
-
-  - **MoE / hybrid:** Grok, MPT, OLMoE, DeepSeek2, GLM-DSA, Nemotron-H, Nemotron-H-MoE, Granite-Hybrid, LFM2-MoE, Minimax-M2, Mistral4, Kimi-Linear, Jamba, Falcon-H1
-  - **State-space / RWKV-style:** Mamba, Mamba2 (and the hybrid Mamba-attention models above)
-  - **Other:** PLAMO2, MiniCPM3, Gemma-3n, OLMo2, BitNet, T5
-
-### 5. Hierarchical layer-tensor parallelism (experimental)
-
-```bash
-llama-cli -m model.gguf -sm layer-tensor -tgs 2 -ctk f16 -ctv f16
-```
-
-Runs layers pipeline-parallel across tensor-parallel groups of 2 GPUs each. Inherits all restrictions of `--split-mode tensor` (flash attention required - forced on unless explicitly disabled, KV cache must be `f16`/`bf16`/`f32`, architecture allow-list applies, `--fit` disabled, backend sampling falls back to the CPU sampler), plus:
-
-- `--tensor-split` is rejected; groups are always uniform.
-- `--main-gpu` is ignored.
-- The number of visible devices must be divisible by `--tensor-group-size`, and there must be at least 2 groups.
-
-**Device ordering matters.** Group *g* is formed from visible devices *g, g+G, g+2G, ...* (stride = number of groups *G*). Arrange `CUDA_VISIBLE_DEVICES` so that GPUs sharing the same board / same host link are adjacent blocks; the stride then makes each group *span* the different host links, so a group's internal reductions can use all host links in parallel. Example: with 8 GPUs on 2 boards of 4 (CUDA indices 0-3 on board A, 4-7 on board B) and `-tgs 2`, *G* = 4, so group 0 = {0, 4}, group 1 = {1, 5}, ... - each group pairs one GPU from each board. Verify the enumeration with `--list-devices` before relying on this.
-
-### 6. With NCCL
-
-There's no runtime flag for NCCL - it's selected at build time (`-DGGML_CUDA_NCCL=ON`, this is the default). Note that NCCL is **not** automatically distributed with CUDA and you may need to install it manually - when in doubt check the CMake log to see whether or not it can find the package. When llama.cpp is compiled with NCCL support it uses it automatically for cross-GPU reductions in `tensor` and `layer-tensor` modes **only when the participating GPUs have peer-to-peer (P2P) access** (and unless overridden with `GGML_CUDA_ALLREDUCE`); without P2P the in-tree reducer is selected instead (see *Slow PCIe / no-P2P systems*). When NCCL is missing on a multi-GPU build, you'll see this one-time warning and performance will be lower:
-
-```
-NVIDIA Collective Communications Library (NCCL) is unavailable, multi GPU performance will be suboptimal
-```
-
-When using the "ROCm" backend (which is the ggml CUDA code translated for AMD via HIP), the AMD equivalent RCCL can be used by compiling with `-DGGML_HIP_RCCL=ON`. Note that RCCL is by default *disabled* because (unlike NCCL) it was not universally beneficial during testing.
-
-### 7. With CUDA peer-to-peer access (`GGML_CUDA_P2P`)
-
-CUDA peer-to-peer (P2P) lets GPUs transfer data directly between each other instead of going through system memory, which generally improves multi-GPU performance. It is **opt-in** at runtime - set the environment variable `GGML_CUDA_P2P` to any value to enable it:
-
-```bash
-GGML_CUDA_P2P=1 llama-cli -m model.gguf -sm tensor
-```
-
-P2P requires driver support (usually restricted to workstation/datacenter GPUs) and **may cause crashes or corrupted outputs on some motherboards or BIOS configurations** (e.g. when IOMMU is enabled). If you see instability after enabling it, unset the variable.
+`CUDA_VISIBLE_DEVICES` controls which GPUs the CUDA backend sees at all; `--device` then selects among them.
 
 ---
 
-## Slow PCIe / no-P2P systems
+## Cross-GPU AllReduce (tensor and layer-tensor only)
 
-On systems where GPUs are attached via narrow PCIe links (e.g. x1 mining-style risers) and peer-to-peer access is unavailable, cross-GPU reductions are staged through host memory and the choice of reduction backend matters:
+`layer` and `row` do not reduce across GPUs, so none of this applies to them.
 
-- `GGML_CUDA_ALLREDUCE={nccl|internal|butterfly}` - selects the cross-GPU reduction backend used by tensor-parallel modes (`tensor`, `layer-tensor`). When set it always wins. When unset, the backend is chosen automatically from whether the participating GPUs can do peer-to-peer (P2P) transfers: if no device pair supports P2P it uses the in-tree reducer (`internal` for a 2-GPU group, `butterfly` otherwise), because on a host-staged rig NCCL is at best not faster and on some rigs (see the NCCL 8-rank fault below) outright crashes; if P2P is available it keeps the previous default (`nccl` on Linux, `internal` elsewhere). The chosen backend is logged at startup as `ggml_cuda_allreduce: using ...`.
-  - `nccl`: use NCCL (requires a build with NCCL support).
-  - `internal`: llama.cpp's own all-reduce, staged through pinned host memory when P2P is unavailable. Supports 2-GPU groups and works on Maxwell (compute capability 5.0) and newer. On host-staged PCIe systems it can beat NCCL, so it is worth benchmarking both.
-  - `butterfly`: use the meta-backend's generic butterfly all-reduce (slowest). `none` is accepted as a deprecated alias.
-- `GGML_CUDA_AR_COPY_THRESHOLD` - internal all-reduce: tensors of this size **in bytes or larger** use the copy-engine path (chunked D2H/H2D copies overlapped via events); smaller tensors use the kernel path. `0` disables the copy-engine path. Default: 1048576 (1 MiB).
-- `GGML_CUDA_AR_COPY_CHUNK_BYTES` - internal all-reduce, copy-engine path: fixed per-chunk copy size in bytes. Unset (default) uses the per-call heuristic `clamp(nbytes/4, 512 KiB, 2 MiB)`; values below 256 KiB are clamped up to it.
-- `GGML_CUDA_AR_BF16_THRESHOLD` - internal all-reduce: F32 tensors of this size **in bytes or larger** are reduced over a BF16 wire (halving on-wire bytes); smaller tensors keep the numerically safe F32 wire. `0` disables the BF16 wire entirely. Default: 131072 (128 KiB). Use `1` for BF16 everywhere, or a huge value for F32 everywhere.
-- `GGML_CUDA_AR_Q8_0_THRESHOLD` - F32 tensors of this size **in bytes or larger** that are cross-GPU reduced with a quantizable reduction path are reduced over an 8-bit `Q8_0` wire. The tensor is first spread through a Fast Walsh-Hadamard rotation (so per-block quantization error is distributed over the whole tensor), then block-quantized to `Q8_0` for the wire (≈1.06 bytes/element instead of BF16's 2), and the accumulated wire-rounded result is inverse-rotated. Two code paths honor this:
-  - **internal all-reduce (2-GPU groups)**: applies on the copy-engine path (tensors at/above `GGML_CUDA_AR_COPY_THRESHOLD`).
-  - **NCCL (N GPUs, e.g. `-sm tensor` or `-sm layer-tensor` with groups > 2)**: because NCCL cannot sum a block-quantized buffer on the ring (each block carries its own fp16 scale, which differs per rank), the reduction is implemented in-tree. It uses a **bandwidth-optimal ring** (reduce-scatter + all-gather: each rank talks only to its two ring neighbours and shuttles ~2x its own wire regardless of rank count), or the all-to-all **quantized butterfly** when the ring shape does not fit. Transfers are **staged through pinned host memory by default** (the reliable path on host-staged / no-P2P rigs — NCCL point-to-point falls back to a shared-memory channel that can be unavailable there). Set `GGML_CUDA_AR_NCCL_P2P` to run the transfers instead as `ncclSend`/`ncclRecv` pairs over the NCCL communicators (device-to-device, no host hop) — the intended fast path on rigs with genuine NVLink / P2P. This is how `Q8_0` all-reduce is achieved for more than 2 GPUs; the NCCL ring itself stays F32/BF16.
-  The tensor's element count must be a multiple of a power of two in {64, 128, 256, 512} (otherwise it falls back to BF16/F32), and the input type must be F32. `0` disables. Default: `0` (disabled). Use `1` for Q8_0 everywhere the quantizable path applies. The ring requires a power-of-two rank count with each rank's chunk block-aligned (`ne/n` a multiple of the block size); when those don't hold it falls back to the butterfly automatically.
-- `GGML_CUDA_AR_Q5_0_THRESHOLD` / `GGML_CUDA_AR_Q4_0_THRESHOLD` - like `GGML_CUDA_AR_Q8_0_THRESHOLD` but for the narrower `Q5_0` (≈0.75 bytes/element) and `Q4_0` (≈0.5625 bytes/element) wires. Lower firmness = more aggressive on-wire narrowing. When set, the *most aggressive* enabled wire whose threshold the tensor satisfies wins: `Q4_0` > `Q5_0` > `Q8_0` > `BF16` > `F32`. Default for both: `0` (disabled). Quantized wires trade numerical precision for bandwidth; keep them disabled for production workloads where reduction accuracy matters. On the NCCL (N-GPU) path, the ring's per-chunk wire bytes shrink with a narrower wire (`Q4_0` < `Q5_0` < `Q8_0`), which cuts the ring's total moved bytes accordingly.
-- `GGML_CUDA_SPIN_WAIT` - CUDA device synchronization waits with blocking-sync by default (lower CPU usage; this changes the CUDA runtime's default auto/spin behavior) - set to any value to restore spin-waiting for lower sync/wake latency at the cost of busy-waiting CPU.
+**Automatic policy.** When `GGML_CUDA_ALLREDUCE` is unset: if no pair of participating devices has CUDA peer-to-peer (P2P) access, the in-tree reducer is used - `internal` for a 2-device group, `butterfly` otherwise. If any pair has P2P, the platform default is `nccl` on Linux and `internal` elsewhere. The choice is logged at startup as `ggml_cuda_allreduce: using ...`.
 
-> **NCCL 8-rank fault on host-staged rigs.** On at least one 8-GPU no-P2P rig (8× Tesla M10, PCIe gen1, libnccl 2.22.3) the default-channel-geometry NCCL collective crashes inside `ncclGroupEnd()`, which dereferences NULL at 8 ranks (2-7 ranks are fine). Setting `NCCL_MAX_NCHANNELS=1` (or `NCCL_BUFFSIZE=512KiB` or less) avoids it. Since such a rig has no P2P, the automatic policy above now selects the in-tree reducer instead of NCCL, so the fault is not hit by default; if you force `GGML_CUDA_ALLREDUCE=nccl` there, set one of those NCCL variables.
+**`GGML_CUDA_ALLREDUCE={nccl|internal|butterfly}`** overrides the policy; when set it always wins. `none` is a deprecated alias for `butterfly`.
 
-### Worked example: 2 boards × 4 GPUs on PCIe x1
+- `nccl`: requires a build with NCCL support (`-DGGML_CUDA_NCCL=ON`, the default) and a libnccl install - NCCL is not bundled with CUDA.
+- `internal`: llama.cpp's own AllReduce, staged through pinned host memory when P2P is unavailable. **Only initialises for exactly 2-device groups**; larger groups fall back to `butterfly`. Works on compute capability 5.0 and newer.
+- `butterfly`: the meta-backend's generic butterfly AllReduce (slowest).
 
-For a rig with 8 GPUs on 2 boards of 4 (no P2P, narrow per-board host links), pair GPUs across the boards for tensor parallelism and pipeline the layers across the pairs:
+**Internal-reducer tuning:**
+
+- `GGML_CUDA_AR_COPY_THRESHOLD` (default `1048576`, 1 MiB): tensors at least this large use the copy-engine path (chunked overlapped D2H/H2D copies); smaller tensors use the kernel path. `0` disables the copy-engine path.
+- `GGML_CUDA_AR_COPY_CHUNK_BYTES`: fixed per-chunk copy size on the copy-engine path. Unset uses `clamp(nbytes/4, 512 KiB, 2 MiB)`; values below 256 KiB are clamped up.
+- `GGML_CUDA_AR_BF16_THRESHOLD` (default `131072`, 128 KiB): F32 tensors at least this large travel a BF16 wire; smaller tensors keep the F32 wire. `0` disables the BF16 wire.
+- `GGML_CUDA_AR_Q8_0_THRESHOLD`, `GGML_CUDA_AR_Q5_0_THRESHOLD`, `GGML_CUDA_AR_Q4_0_THRESHOLD` (default `0`, disabled): F32 tensors at least the threshold travel the narrower `Q8_0` / `Q5_0` / `Q4_0` wire. When several are enabled the most aggressive satisfied one wins (`Q4_0` > `Q5_0` > `Q8_0` > `BF16` > `F32`). The element count must be rotatable by a Walsh-Hadamard transform. Block-quantized wires are summed only by the in-tree reducer - `internal` (2-device copy path) or the N-GPU quantized ring/butterfly; NCCL cannot sum them.
+- `GGML_CUDA_AR_NCCL_P2P`: run the quantized ring's transfers as `ncclSend`/`ncclRecv` pairs (device-to-device). Default is staged through pinned host memory, the reliable path on host-staged / no-P2P rigs.
+
+**Other environment variables:**
+
+- `GGML_CUDA_SPIN_WAIT`: by default CUDA synchronisation uses blocking-sync (low CPU). Set to any value to restore spin-waiting for lower sync/wake latency at the cost of busy-waiting CPU.
+- `GGML_CUDA_P2P`: opt-in CUDA peer-to-peer access (any value enables it). Requires driver support and can be unstable on some motherboards/BIOS configurations (e.g. IOMMU enabled). Not needed on a rig whose GPUs report no peer access to begin with.
+
+> **NCCL 8-rank fault.** On an 8-GPU no-P2P rig (observed with libnccl 2.22.3 over PCIe gen1), NCCL's default channel geometry crashes inside `ncclGroupEnd()` at exactly 8 ranks (2-7 ranks are fine). Workaround: `NCCL_MAX_NCHANNELS=1` or `NCCL_BUFFSIZE=512KiB` or less. The automatic policy above never selects NCCL when there is no P2P, so the fault is only hit if `GGML_CUDA_ALLREDUCE=nccl` is forced.
+
+---
+
+## Recommended configuration: no-P2P PCIe multi-GPU
+
+This applies to any multi-GPU box where `nvidia-smi topo -m` shows no `NV#` and `cudaDeviceCanAccessPeer` reports no pairs - i.e. every cross-GPU transfer is staged through host memory, including boxes whose GPUs only share PCIe host bridges (PIX groups).
 
 ```bash
-GGML_CUDA_ALLREDUCE=internal \
-llama-cli -m model.gguf -ngl 99 -sm layer-tensor -tgs 2 -fa 1 -ctk f16 -ctv f16 ...
+llama-cli -m model.gguf -ngl 99 -sm layer-tensor -tgs 2 -fa 1 -ctk f16 -ctv f16
 ```
 
-This creates 4 tensor-parallel groups of 2 GPUs ({0,4}, {1,5}, {2,6}, {3,7} with the default enumeration), each spanning both boards' host links, with layers pipelined across the 4 groups.
+With 8 visible devices this forms 4 tensor groups of 2 - `{0,4}, {1,5}, {2,6}, {3,7}` under the default enumeration, each spanning both host bridges - and the automatic policy selects the in-tree `internal` reducer for every group.
+
+Measured on an 8-GPU PCIe-gen1 box with no P2P (173-token prompt, 32 generated tokens, all 8 GPUs, 27B hybrid-SSM model, `f16` KV):
+
+| `-sm` | AllReduce | prompt t/s | eval t/s | peak VRAM/GPU | exit |
+|---|---|---|---|---|---|
+| `layer` | none (no reduction) | 5.97 | 4.63 | ~4.9 GiB | 0 |
+| `tensor` | butterfly | 5.37 | 2.76 | ~0.34 GiB | 0 |
+| `layer-tensor -tgs 2` | internal (x4) | 14.59 | 6.92 | ~1.8 GiB | 0 |
+| `layer-tensor -tgs 4` | butterfly (x2) | 10.67 | 4.80 | ~0.88 GiB | 0 |
+
+Commands: `llama-cli -m <model> -ngl 99 -fa 1 -ctk f16 -ctv f16 --single-turn -n 32 -p "<prompt>" <split args> --verbose`. Peak VRAM is the sum of the log's model / KV / RS / compute buffer sizes; a tensor-mode group buffer is divided by the group size.
+
+`layer-tensor -tgs 2` wins because it is the only configuration that both keeps every reduction a 2-device `internal` reduction and spreads layers across all GPUs. Pure `tensor` and `tgs 4` use the slower butterfly; pure `layer` leaves most GPUs' compute idle during token generation.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | How to fix |
+| Symptom | Fix |
 |---|---|
-| Startup error *"SPLIT_MODE_TENSOR requires flash_attn to be enabled"* | Add `-fa on` or remove `-fa off`. |
-| Startup error *"simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented"* | Use `-ctk f16 -ctv f16` (or `bf16`/`f32`) with `--split-mode tensor`. |
-| Startup error *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'X'"* | Architecture not on the TENSOR allow-list. Use `--split-mode layer`. |
-| Startup error *"number of devices is not divisible by the tensor group size"* | Adjust `--tensor-group-size` (or `CUDA_VISIBLE_DEVICES`) so `n_devices % tgs == 0`, with at least 2 groups. |
-| Startup error *"tensor_split is not supported with LLAMA_SPLIT_MODE_LAYER_TENSOR"* | Remove `-ts/--tensor-split`; `layer-tensor` groups are always uniform. |
-| Warning *"NCCL is unavailable, multi GPU performance will be suboptimal"* | llama.cpp wasn't built with NCCL. Either accept the lower performance or install NCCL and rebuild. |
-| CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |
-| Performance is worse with multi-GPU than single-GPU | The performance is bottlenecked by GPU interconnect speed. For `--split-mode tensor`, verify that NCCL is being used. Try `--split-mode layer` (less communication than `tensor`). Increase GPU interconnect speed via more PCIe lanes or e.g. NVLink (if available). |
-| GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or you are accidentally hiding the GPUs via an environment variable like `CUDA_VISIBLE_DEVICES=-1`. Or your build doesn't include support for the relevant backend. |
-| Crashes or corrupted outputs after setting `GGML_CUDA_P2P=1` | Some motherboards and BIOS settings (e.g. with IOMMU enabled) don't support CUDA peer-to-peer reliably. Unset `GGML_CUDA_P2P`. |
+| *"SPLIT_MODE_TENSOR requires flash_attn to be enabled"* | Add `-fa 1`. |
+| *"simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented"* | Use `-ctk f16 -ctv f16` (or `bf16` / `f32`). |
+| *"tensor split mode not implemented for architecture 'X'"* | Architecture is not on the tensor allow-list; use `-sm layer`. |
+| *"number of devices is not divisible by the tensor group size"* | Adjust `-tgs` or `CUDA_VISIBLE_DEVICES` so `n_devices % tgs == 0`. |
+| *"needs at least 2 groups"* | Lower `-tgs` or use `-sm tensor` for a single group. |
+| *"tensor_split is not supported with LLAMA_SPLIT_MODE_LAYER_TENSOR"* | Drop `-ts`; `layer-tensor` groups are uniform. |
+| `--fit` warning in `tensor` / `layer-tensor` | Expected: auto-fit is unimplemented there. Pass `-fit off`, or set `-c` / `-ngl` manually. |
+| OOM at startup or prefill in `tensor` / `layer-tensor` | Auto-fit is off, so size memory yourself: lower `-c`, lower `-np` for `llama-server`, or lower `-ngl` as a last resort. |
+| Multi-GPU slower than single-GPU | Follow *Which mode to use*; check the `ggml_cuda_allreduce: using ...` line to confirm the intended reducer. |
+| GPU not used | `-ngl` too low; try `-ngl 99` or `all`. |
+| Instability after `GGML_CUDA_P2P` | Unset it; some motherboards/BIOS do not support P2P reliably. |
