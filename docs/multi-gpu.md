@@ -53,7 +53,7 @@ Reasoning: with no P2P, every cross-GPU reduction is staged through host memory,
 | `-fa` | `--flash-attn` | `on`\|`off`\|`auto` | `auto` | Required by `tensor` / `layer-tensor`. |
 | `-ctk`, `-ctv` | `--cache-type-k` / `--cache-type-v` | `f32`\|`f16`\|`bf16`\|`q8_0`\|... | `f16` | KV cache types. |
 | `-ot` | `--override-tensor` | `pattern=buffer,...` | - | Force a tensor-name pattern onto a buffer type, e.g. keep some weights on CPU to rebalance VRAM across GPUs. |
-| `-fit` | `--fit` | `on`\|`off` | `on` | Auto-size unset arguments to device memory. Implemented only for `none` / `layer` / `row`; with `tensor` / `layer-tensor` it aborts and the model loads with the supplied/default arguments instead. Use `-fit off` to silence the warning. |
+| `-fit` | `--fit` | `on`\|`off` | `on` | Auto-size unset arguments to device memory. Implemented only for `none` / `layer` / `row`; with `tensor` / `layer-tensor` it logs a warning and is skipped, and the model loads with the supplied/default arguments instead. Use `-fit off` to silence the warning. |
 | `-dev` | `--device` | device names, or `none` | auto | Restrict which devices llama.cpp may use; inspect with `--list-devices`. |
 | | `--list-devices` | - | - | Print devices and their memory. |
 
@@ -65,7 +65,7 @@ Reasoning: with no P2P, every cross-GPU reduction is staged through host memory,
 
 `layer` and `row` do not reduce across GPUs, so none of this applies to them.
 
-**Automatic policy.** When `GGML_CUDA_ALLREDUCE` is unset: if no pair of participating devices has CUDA peer-to-peer (P2P) access, the in-tree reducer is used - `internal` for a 2-device group, `butterfly` otherwise. If any pair has P2P, the platform default is `nccl` on Linux and `internal` elsewhere. The choice is logged at startup as `ggml_cuda_allreduce: using ...`.
+**Automatic policy.** When `GGML_CUDA_ALLREDUCE` is unset: if no pair of participating devices has CUDA peer-to-peer (P2P) access, the in-tree reducer is used - `internal` for a 2-device group, `butterfly` otherwise. If any pair has P2P, the platform default is `nccl` on Linux and `internal` elsewhere. The choice is logged when the AllReduce communicator is created as `ggml_cuda_allreduce: using ...`.
 
 **`GGML_CUDA_ALLREDUCE={nccl|internal|butterfly}`** overrides the policy; when set it always wins. `none` is a deprecated alias for `butterfly`.
 
