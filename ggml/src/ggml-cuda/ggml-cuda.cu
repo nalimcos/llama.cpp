@@ -986,11 +986,10 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 //   * comp_done[2] -- compute-stream add/quant for a parity done; gates the
 //     next use of qn_a/rot_acc for that parity.
 
-// Sub-chunks per ring step for bidirectional D2H||H2D pipelining.  Effective C
-// is the largest value in [1..GGML_CUDA_AR_RING_SUBCHUNKS_MAX] that divides the
-// chunk exactly and keeps each sub-chunk wire-block aligned (falls back to
-// 1 = monolithic).
-static constexpr int GGML_CUDA_AR_RING_SUBCHUNKS_MAX = 8; // event-array capacity
+// Sub-chunks per ring step for bidirectional D2H||H2D pipelining.  The step
+// splits its chunk into C sub-chunks, falling back to 1 = monolithic when the
+// chunk does not divide exactly.
+static constexpr int GGML_CUDA_AR_RING_SUBCHUNKS = 2;
 
 struct ggml_cuda_ar_ring_rank {
     // Parity double-buffered pinned host staging.  Step s uses host[s%2]; two
@@ -1009,12 +1008,12 @@ struct ggml_cuda_ar_ring_rank {
     // cudaStreamWaitEvent on its h2d_stream.  Per-parity so a step only ever
     // waits on its own parity's record.  One event per sub-chunk so the pull
     // side can wait on each sub-chunk independently as it lands.
-    cudaEvent_t d2h_ready[2][GGML_CUDA_AR_RING_SUBCHUNKS_MAX] = {};
+    cudaEvent_t d2h_ready[2][GGML_CUDA_AR_RING_SUBCHUNKS] = {};
 
     // "Consumer's H2D sub-chunk c for this parity landed on device".  Gates the
     // compute-stream add that reads the freshly-pulled qn_rx slot.  The compute
     // add waits only on the LAST sub-chunk (c=C-1) of the parity.
-    cudaEvent_t recv_h2d_done[2][GGML_CUDA_AR_RING_SUBCHUNKS_MAX] = {};
+    cudaEvent_t recv_h2d_done[2][GGML_CUDA_AR_RING_SUBCHUNKS] = {};
 
     // "Consumer drained its neighbor's host[parity]".  Indexed by the CONSUMER
     // device (recorded on the consumer's own AR stream); the OWNER waits on its
@@ -1110,7 +1109,7 @@ struct ggml_backend_cuda_comm_context {
                 }
             }
             for (int p = 0; p < 2; ++p) {
-                for (int c = 0; c < GGML_CUDA_AR_RING_SUBCHUNKS_MAX; ++c) {
+                for (int c = 0; c < GGML_CUDA_AR_RING_SUBCHUNKS; ++c) {
                     if (rk.d2h_ready[p][c])     { cudaEventDestroy(rk.d2h_ready[p][c]); }
                     if (rk.recv_h2d_done[p][c]) { cudaEventDestroy(rk.recv_h2d_done[p][c]); }
                 }
@@ -1185,7 +1184,7 @@ struct ggml_backend_cuda_comm_context {
                      cudaEventCreateWithFlags(&rk.host_read_done[p], cudaEventDisableTiming) == cudaSuccess;
             }
             for (int p = 0; ok && p < 2; ++p) {
-                for (int c = 0; ok && c < GGML_CUDA_AR_RING_SUBCHUNKS_MAX; ++c) {
+                for (int c = 0; ok && c < GGML_CUDA_AR_RING_SUBCHUNKS; ++c) {
                     ok = ok &&
                          cudaEventCreateWithFlags(&rk.d2h_ready[p][c], cudaEventDisableTiming) == cudaSuccess &&
                          cudaEventCreateWithFlags(&rk.recv_h2d_done[p][c], cudaEventDisableTiming) == cudaSuccess;
@@ -1619,11 +1618,10 @@ static bool ggml_backend_cuda_comm_allreduce_quant_ring(
     const int64_t nn = (int64_t) n;
 
     // Per-step sub-chunk geometry.  chunk_wire is already exact per-rank wire
-    // (wire_nbytes / n).  Pick the largest C in [1..GGML_CUDA_AR_RING_SUBCHUNKS_MAX]
-    // that divides chunk_wire exactly and keeps each sub-chunk wire-block
-    // aligned (sub_wire a multiple of the wire block size).  Falls back to
-    // 1 = monolithic single-copy.
-    int    C = 2;
+    // (wire_nbytes / n).  C divides chunk_wire exactly and keeps each sub-chunk
+    // wire-block aligned (sub_wire a multiple of the wire block size).  Falls
+    // back to 1 = monolithic single-copy.
+    int    C = GGML_CUDA_AR_RING_SUBCHUNKS;
     size_t block_wire = 1;
     switch (wire) {
         case GGML_TYPE_Q8_0: block_wire = sizeof(block_q8_0); break;
