@@ -12,8 +12,7 @@
 // 1024 threads/SM (50%); 64-thread blocks reach 2048.  Per-thread lane math and all
 // arithmetic are unchanged: every output element is computed exactly once by the same
 // dequantize_<t> helper with the same expression sequence, so outputs are bitwise
-// identical to the legacy launch.  Only applied where measured faster on sm_50
-// (m=11008, k=4096; see bench_logs/mmq_audit.md); re-validate per arch before use.
+// identical to the legacy launch.
 // unset or any other value -> packed; an explicit off-string ("0","false","no","off",
 // case-insensitive) reverts to the legacy launch config, byte-identical to before.
 static bool ggml_cuda_deq_wide_enabled() {
@@ -322,9 +321,6 @@ static void dequantize_block_cuda(const void * vx, dst_t * y,
         const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
     const int64_t ne0203 = ne02*ne03;
     const uint3 ne02_fdv = init_fastdiv_values(ne02);
-    // measured on sm_50 (m=11008, k=4096, n=256): the 4-values-per-thread variant is ~25%
-    // faster for the qr==2 types (q5_0/q5_1) and neutral-to-worse for qr==1 (q8_0), which
-    // therefore keep the legacy launch byte-identical (see bench_logs/mmq_audit.md).
     if (ggml_cuda_deq_wide_enabled() && qr == 2) {
         const dim3 num_blocks((ne00 + 4*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (4*CUDA_DEQUANTIZE_BLOCK_SIZE), (int)std::min(ne01, (int64_t)65535), (int)std::min(ne0203, (int64_t)65535));
         dequantize_block_wide<qk, qr, dequantize_kernel><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>
