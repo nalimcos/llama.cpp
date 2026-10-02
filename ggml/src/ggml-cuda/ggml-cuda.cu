@@ -2906,9 +2906,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     }
 
     // cc 5.x (Maxwell): token-chunked fused MMVQ MoE path, no stream sync
-    if (ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4 &&
-            dst->ne[2] > MMVQ_MAX_BATCH_SIZE && dst->ne[2] <= MMVQ_MOE_CHUNK_MAX_BATCH && dst->ne[0] % QK8_1 == 0 &&
-            GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= 500 && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_PASCAL) {
+    if (ggml_cuda_should_use_mmvq_moe_chunk(src0->type, cc, dst->ne[2], dst->ne[0])) {
         return false;
     }
 
@@ -2955,9 +2953,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         // cc 5.x (Maxwell): no dp4a/MMQ/MMF. Route medium MoE batches to the fused MMVQ MoE kernel
         // (token-chunked in ggml_cuda_mul_mat_vec_q) instead of the synchronizing fallback below.
-        if (ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4 &&
-                ne2 > MMVQ_MAX_BATCH_SIZE && ne2 <= MMVQ_MOE_CHUNK_MAX_BATCH && ne00 % QK8_1 == 0 &&
-                GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= 500 && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_PASCAL) {
+        if (ggml_cuda_should_use_mmvq_moe_chunk(src0->type, cc, ne2, ne00)) {
             ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
             return;
         }
@@ -3009,7 +3005,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
         for (int64_t iex = 0; iex < n_expert_used; ++iex) {
             const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-            assert(expert_to_use >= 0 && expert_to_use < ne02);
             if (expert_to_use >= 0 && expert_to_use < ne02 && expert_seen[expert_to_use] != i12) {
                 expert_seen[expert_to_use] = i12;
                 tokens_per_expert[expert_to_use]++;

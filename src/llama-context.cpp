@@ -4010,10 +4010,6 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 }
 
 enum llama_context_type llama_get_ctx_type(const struct llama_context * ctx) {
-    if (!ctx) {
-        return LLAMA_CONTEXT_TYPE_DEFAULT;
-    }
-
     return ctx->get_cparams().ctx_type;
 }
 

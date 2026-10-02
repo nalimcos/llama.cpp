@@ -25,6 +25,7 @@
 #include <array>
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cfloat>
 #include <cstdio>
 #include <string>
@@ -376,6 +377,27 @@ static bool cp_async_available(const int cc) {
 static bool blackwell_mma_available(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL &&
            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_RUBIN;
+}
+
+// Boolean env flag: unset -> default_on; explicit off-string ("0","false","no","off",
+// case-insensitive) -> false; any other present value -> true.
+static inline bool ggml_cuda_env_flag(const char * name, bool default_on) {
+    const char * env = getenv(name);
+    if (env == nullptr) {
+        return default_on;
+    }
+    for (const char * off : { "0", "false", "no", "off" }) {
+        bool off_match = true;
+        for (const char * a = env, * b = off; ; ++a, ++b) {
+            const char ca = (char) std::tolower((unsigned char) *a);
+            if (ca != *b) { off_match = false; break; }
+            if (*b == '\0') break;
+        }
+        if (off_match) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Checks whether the tensor's base data pointer and higher-dimensional strides are byte-aligned to `alignment` bytes.

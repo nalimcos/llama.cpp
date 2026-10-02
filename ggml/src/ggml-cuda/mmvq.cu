@@ -150,7 +150,8 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     return MMVQ_PARAMETERS_GENERIC;
 }
 
-// Per-architecture maximum batch size for which MMVQ should be used for MUL_MAT_ID.
+// Maximum MUL_MAT_ID batch size for MMVQ on pre-Turing NVIDIA GPUs (Pascal and older);
+// Maxwell (cc 5.x) has its own override, get_mmvq_mmid_max_batch_maxwell.
 // Returns a value <= MMVQ_MAX_BATCH_SIZE. Default is MMVQ_MAX_BATCH_SIZE.
 // Check https://github.com/ggml-org/llama.cpp/pull/20905#issuecomment-4145835627 for details
 
@@ -455,6 +456,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }
 
+bool ggml_cuda_should_use_mmvq_moe_chunk(enum ggml_type type, int cc, int64_t ne2, int64_t ne00) {
+    return ggml_is_quantized(type) && type != GGML_TYPE_MXFP4 && type != GGML_TYPE_NVFP4 &&
+        ne2 > MMVQ_MAX_BATCH_SIZE && ne2 <= MMVQ_MOE_CHUNK_MAX_BATCH && ne00 % QK8_1 == 0 &&
+        GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= 500 && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_PASCAL;
+}
+
 // rows_per_block for the MoE kernel (mul_mat_vec_q_moe) on Maxwell (cc 5.x).
 // 2 was tuned on newer archs; overridable here for benchmarking.
 #ifndef GGML_MMVQ_MOE_RPB_MAXWELL
@@ -466,10 +473,12 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
 // (mmvq_tiled_rows_per_block, nwarps=2); sm_52 keeps the MMVQ_PARAMETERS_MAXWELL table tuning.
 // Selected at configure time from the CUDA arch list (GGML_CUDA_MAXWELL_* in CMakeLists.txt);
 // in a build targeting both variants the per-device cc picks the right one.
-#ifdef GGML_CUDA_MAXWELL_GM107
-#define GGML_MMVQ_MAXWELL_SM50_TILED_N1 1
+#if defined(GGML_CUDA_MAXWELL_GM107)
+#define GGML_MMVQ_MAXWELL_SM50_TILED_N1 1   // sm_50/GM107 (64 KiB): tiled n=1 decode
+#elif defined(GGML_CUDA_MAXWELL_GM204)
+#define GGML_MMVQ_MAXWELL_SM50_TILED_N1 0   // sm_52/GM204 (96 KiB): MMVQ_PARAMETERS_MAXWELL table
 #else
-#define GGML_MMVQ_MAXWELL_SM50_TILED_N1 0
+#define GGML_MMVQ_MAXWELL_SM50_TILED_N1 0   // not a Maxwell build
 #endif
 
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
@@ -695,56 +704,17 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-// Optional n=1 decode restructure for latency hiding (rows per block x nwarps retune).
-// Tuned on Tesla M10 (sm_50, GENERIC table) with bench_logs/vecdot_ilp.cu:
-// nwarps 4->2 gives each thread 2 independent kbx iterations (implicit ILP), and for
-// several types 2-4 rows per block add independent accumulators with shared q8_1 y.
-// Default ON (kernel-only: 17 quant types faster, no regressions, q8_0 excluded;
-// e2e 27B IQ1_S decode +5.5%): setting GGML_CUDA_MMVQ_TILED to an explicit
-// off-string ("0","false","no","off", case-insensitive) reverts to the legacy
-// launch, whose config is byte-identical to before the tiled path existed;
-// unset or any other value -> tiled per-type table below (nwarps=2).  Purely a
-// caller-side launch-config knob (results identical both ways).  Only applied
-// when table_id == MMVQ_PARAMETERS_GENERIC; re-validate per arch before use.
+// Caller-side launch-config knob for the n=1 tiled decode path (rows per block x nwarps
+// retune); results are identical either way.  GGML_CUDA_MMVQ_TILED selects the tiled table
+// (mmvq_tiled_rows_per_block) vs. the legacy launch.
 static int mmvq_tiled_mode() {
-    static int mode = -1;
-    if (mode < 0) {
-        const char * env = getenv("GGML_CUDA_MMVQ_TILED");
-        bool on = true;
-        if (env != nullptr) {
-            for (const char * off : { "0", "false", "no", "off" }) {
-                // Case-insensitive match -> OFF.  Any other present value -> ON.
-                bool off_match = true;
-                for (const char *a = env, *b = off; ; ++a, ++b) {
-                    const char ca = (char) std::tolower((unsigned char) *a);
-                    if (ca != *b) { off_match = false; break; }
-                    if (*b == '\0') break;
-                }
-                if (off_match) { on = false; break; }
-            }
-        }
-        mode = on ? 1 : 0;
-    }
-    return mode;
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_MMVQ_TILED", true);
+    return enabled ? 1 : 0;
 }
 
-// rows per CUDA block at ncols_dst=1 with the tiled path (measured best, kernel-only, sm_50).
-// WIDENED re-derivation: R in {1,2,3,4,6,8} x nwarps in {1,2,3,4,6,8} at m=11008 AND m=1376 (k=4096),
-// bench_logs/vecdot_ilp2.cu (byte-faithful mul_mat_vec_q replica, repo's real vec_dot, interleaved
-// reps so drift cannot favour a config by measurement order). Findings:
-//  - every nwarps != 2 variant REORDERS the per-row accumulation and is NOT bitwise identical to the
-//    shipped nwarps=2 kernels (rel. diff 3e-5..4e-2) -> excluded by the bitwise bar; nwarps stays 2.
-//    ((64,x)/(128,1) block dims are structurally illegal: the reduction is warp-aligned.)
-//  - only R moves within the bitwise-safe space. R winners re-confirmed by alternating head-to-head
-//    A/B (median of 16..32 samples per side, both shapes, bitwise):
-//      q5_K  R1 -> R2: -6.3% @m=11008 (47% -> 50% of the 76.2 GB/s weight roofline), -4.5% @m=1376
-//      q6_K  R1 -> R2: -6.3% @m=11008, -4.6% @m=1376
-//      q2_K  R2 -> R4: -3.5% @m=11008, -3.5% @m=1376
-//      q5_0  R2 -> R3: -3.7% @m=11008, -2.1% @m=1376
-//  - unchanged after re-measurement (no >= 3% head-to-head win): q4_0/q4_1 R2, q4_K R4 (R3 -0.8/-1.5%),
-//    q5_1 R4, iq2_xxs/iq2_xs/iq3_xxs/iq3_s/iq4_nl/iq4_xs R2, iq2_s/iq1_s/iq1_m R1, q8_0 legacy.
-//  - no (type,shape) optimum differs by >= 5% between m=11008 and m=1376 -> no shape-conditional table.
-//  - q8_0 stays untiled (legacy R1/NW4, ~66-70% roofline, no win).
+// Rows per CUDA block at ncols_dst=1 with the tiled path; 0 means "not tiled".
+// nwarps stays 2: every other nwarps reorders the per-row accumulation and is not bitwise
+// identical to the nwarps=2 kernels, and only warp-aligned block dims are structurally legal.
 static constexpr __host__ int mmvq_tiled_rows_per_block(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
@@ -892,8 +862,8 @@ static __global__ void mul_mat_vec_q(
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
     if (rows_per_cuda_block > 1 && row0 + rows_per_cuda_block > (int) nrows_x) {
-        // partial last block (nrows_x not divisible by rows_per_cuda_block): dot only rows
-        // that exist, so we never read past the end of the weight tensor. Cold path.
+        // partial-last-block copy of the main kbx loop below (keep the two in sync)
+        // dot only rows that exist, so we never read past the end of the weight tensor. Cold path.
         for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
             const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -918,6 +888,7 @@ static __global__ void mul_mat_vec_q(
             }
         }
     } else {
+    // main kbx loop; the partial-last-block copy above must stay in sync
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -1729,8 +1700,8 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    // MMVQ_MOE_CHUNK_MAX_BATCH allows the cc 5.x token-chunk path; other archs still use <= MMVQ_MAX_BATCH_SIZE.
-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE || ne12 <= MMVQ_MOE_CHUNK_MAX_BATCH);
+    // The cc 5.x token-chunk path is capped at MMVQ_MOE_CHUNK_MAX_BATCH; other archs stay at MMVQ_MAX_BATCH_SIZE.
+    GGML_ASSERT(!ids || ne12 <= MMVQ_MOE_CHUNK_MAX_BATCH);
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
@@ -1820,13 +1791,10 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    // cc 5.x (Maxwell): no dp4a/MMQ/MMF, so split medium MoE batches into per-type token chunks and
-    // use the fused MMVQ MoE kernel instead of the synchronizing fallback.
+    // cc 5.x (Maxwell): no dp4a/MMQ/MMF, so split medium MoE batches into per-type token chunks
+    // and use the fused MMVQ MoE kernel instead of the synchronizing fallback.
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    // MXFP4/NVFP4 use a different activation quantization; keep them on the fallback.
-    const bool chunkable = ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4;
-    if (ids && chunkable && ne2 > MMVQ_MAX_BATCH_SIZE && ne2 <= MMVQ_MOE_CHUNK_MAX_BATCH && ne00 % QK8_1 == 0 &&
-            GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= 500 && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_PASCAL) {
+    if (ids && ggml_cuda_should_use_mmvq_moe_chunk(src0->type, cc, ne2, ne00)) {
         const uint3 nchannels_y_fd = init_fastdiv_values(nchannels_y);
         const int   warp_size      = ggml_cuda_info().devices[ctx.device].warp_size;
         // The fused MoE kernel's __launch_bounds__ is per-type max_batch*warp, so chunk by that limit.

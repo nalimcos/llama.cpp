@@ -1,9 +1,7 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
 
-#include <cctype>
 #include <cstdint>
-#include <cstdlib>
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
@@ -20,27 +18,11 @@
 // unset or any other value -> packed; an explicit off-string ("0","false","no","off",
 // case-insensitive) reverts to the legacy launch config, byte-identical to before.
 static bool ggml_cuda_deq_wide_enabled() {
-    static int mode = -1;
-    if (mode < 0) {
-        const char * env = getenv("GGML_CUDA_DEQ_WIDE");
-        bool on = true;
-        if (env != nullptr) {
-            for (const char * off : { "0", "false", "no", "off" }) {
-                // Case-insensitive match -> OFF.  Any other present value -> ON.
-                bool off_match = true;
-                for (const char *a = env, *b = off; ; ++a, ++b) {
-                    const char ca = (char) std::tolower((unsigned char) *a);
-                    if (ca != *b) { off_match = false; break; }
-                    if (*b == '\0') break;
-                }
-                if (off_match) { on = false; break; }
-            }
-        }
-        mode = on ? 1 : 0;
-    }
-    return mode == 1;
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_DEQ_WIDE", true);
+    return enabled;
 }
 
+// 2 values per thread; dequantize_block_wide below is the 4-values-per-thread twin (keep in sync)
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y,
         const int64_t ne00, const int64_t ne01,
@@ -77,7 +59,7 @@ static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __
 }
 
 // wide: 4 values per thread (2 dequantize calls) instead of 2, same grid layout halved;
-// per-element math identical, ILP doubled (independent float2 chains)
+// per-element math identical, ILP doubled (independent float2 chains) (keep in sync with dequantize_block above)
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void dequantize_block_wide(const void * __restrict__ vx, dst_t * __restrict__ y,
         const int64_t ne00, const int64_t ne01,
