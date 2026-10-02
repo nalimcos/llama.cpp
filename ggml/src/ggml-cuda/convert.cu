@@ -9,12 +9,13 @@
 
 // GGML_CUDA_DEQ_WIDE (launch-config knob, results bitwise identical both ways):
 // packs multiple independent super-block jobs per CUDA block for the quant -> f32/f16
-// dequant kernels used e.g. by the cuBLAS MUL_MAT fallback.  On pre-Pascal NVIDIA GPUs
-// (e.g. sm_50) the legacy 32-thread blocks cap residency at 32 blocks x 32 threads =
-// 1024 threads/SM (50%); 64-thread blocks reach 2048.  Per-thread lane math and all
-// arithmetic are unchanged: every output element is computed exactly once by the same
-// dequantize_<t> helper with the same expression sequence, so outputs are bitwise
-// identical to the legacy launch.  Only applied where measured faster on sm_50
+// dequant kernels used e.g. by the cuBLAS MUL_MAT fallback.  The legacy launch
+// computes 2 elements per thread; the wide launch computes 4 (two independent
+// dequantize calls), halving the block count and doubling per-thread ILP.
+// Per-thread lane math and all arithmetic are unchanged: every output element
+// is computed exactly once by the same dequantize_<t> helper with the same
+// expression sequence, so outputs are bitwise identical to the legacy launch.
+// Only applied where measured faster on sm_50
 // (m=11008, k=4096; see bench_logs/mmq_audit.md); re-validate per arch before use.
 // unset or any other value -> packed; an explicit off-string ("0","false","no","off",
 // case-insensitive) reverts to the legacy launch config, byte-identical to before.
