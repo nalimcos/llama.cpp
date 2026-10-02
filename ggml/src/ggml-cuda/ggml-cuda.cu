@@ -978,8 +978,9 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 //   * d2h_ready[2][C]  -- owner staged sub-chunk c of its send chunk to
 //     host[parity]+c*sub_wire; consumed by the right neighbor via
 //     cudaStreamWaitEvent.
-//   * recv_h2d_done[2][C] -- consumer's H2D sub-chunks landed on device; gates
-//     the compute stream's add for that parity (waits on the last sub-chunk).
+//   * recv_h2d_done[2][C] -- consumer's H2D sub-chunks landed on device; the
+//     reduce-scatter add waits on each sub-chunk, the all-gather replace only
+//     on the last.
 //   * host_read_done -- consumer drained its neighbor's host slot; the owner
 //     waits on it before overwriting in a later step / later AR.  This is the
 //     ring analogue of allreduce.cu's host_large_read_done cross-AR fence.
@@ -1011,8 +1012,9 @@ struct ggml_cuda_ar_ring_rank {
     cudaEvent_t d2h_ready[2][GGML_CUDA_AR_RING_SUBCHUNKS] = {};
 
     // "Consumer's H2D sub-chunk c for this parity landed on device".  Gates the
-    // compute-stream add that reads the freshly-pulled qn_rx slot.  The compute
-    // add waits only on the LAST sub-chunk (c=C-1) of the parity.
+    // compute-stream add that reads the freshly-pulled qn_rx slot.  The
+    // reduce-scatter add waits on every sub-chunk; the all-gather replace waits
+    // only on the last (c=C-1).
     cudaEvent_t recv_h2d_done[2][GGML_CUDA_AR_RING_SUBCHUNKS] = {};
 
     // "Consumer drained its neighbor's host[parity]".  Indexed by the CONSUMER
