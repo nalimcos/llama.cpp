@@ -1268,13 +1268,7 @@ struct cmd_params_instance {
         mparams.lazy_mode     = lazy_mode;
         mparams.main_gpu      = main_gpu;
         mparams.tensor_group_size = tensor_group_size;
-        if (split_mode == LLAMA_SPLIT_MODE_LAYER_TENSOR &&
-            std::all_of(tensor_split.begin(), tensor_split.end(), [](float v) { return v == 0.0f; })) {
-            // tensor_split is not supported with layer-tensor split; pass nullptr if it was not set
-            mparams.tensor_split = nullptr;
-        } else {
-            mparams.tensor_split = tensor_split.data();
-        }
+        mparams.tensor_split = tensor_split.data();
         mparams.no_host       = no_host;
         mparams.use_extra_bufts = repack;
 

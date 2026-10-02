@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -405,9 +404,7 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
     for (size_t i = 0; i < n_simple_bufts; i++) {
         ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
         ggml_tensor piece = *tensor;
-        if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
-            ggml_backend_meta_get_piece_shape(tensor, split_state, n_simple_bufts, i, piece.ne, piece.nb);
-        }
+        ggml_backend_meta_get_piece_shape(tensor, split_state, n_simple_bufts, i, piece.ne, piece.nb);
         const size_t alloc_size = ggml_backend_buft_get_alloc_size(simple_buft, &piece);
         max_alloc_size = std::max(max_alloc_size, alloc_size);
     }
@@ -2049,25 +2046,7 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
-// Optional sub-graph rebuild timing, enabled by GGML_SCHED_TIME_COPIES=1
-// (paired with the scheduler copy timing in ggml-backend.cpp). Silent when disabled.
-static struct ggml_meta_rebuild_stats {
-    bool enabled = getenv("GGML_SCHED_TIME_COPIES") != nullptr;
-    std::chrono::duration<double> rebuild{0};
-    int64_t n_compute = 0;
-    int64_t n_rebuild = 0;
-    ~ggml_meta_rebuild_stats() {
-        if (enabled) {
-            fprintf(stderr, "[META_REBUILD] computes=%lld rebuilds=%lld (%.3f ms total, %.3f ms/compute)\n",
-                    (long long)n_compute, (long long)n_rebuild,
-                    rebuild.count()*1e3,
-                    n_compute ? rebuild.count()*1e3/n_compute : 0.0);
-        }
-    }
-} g_meta_rebuild_stats;
-
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    if (g_meta_rebuild_stats.enabled) g_meta_rebuild_stats.n_compute++;
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
@@ -2088,7 +2067,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
 
     if (needs_rebuild) {
-        const auto t_rebuild0 = g_meta_rebuild_stats.enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::set<ggml_backend_buffer_t> used_buffers;
         for (int i = 0; i < cgraph->n_leafs; i++) {
             if (ggml_backend_buffer_is_meta(cgraph->leafs[i]->buffer)) {
@@ -2389,10 +2367,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 cgraph_ij->uid = ggml_graph_next_uid();
             }
-        }
-        if (g_meta_rebuild_stats.enabled) {
-            g_meta_rebuild_stats.rebuild += std::chrono::steady_clock::now() - t_rebuild0;
-            g_meta_rebuild_stats.n_rebuild++;
         }
     }
 
