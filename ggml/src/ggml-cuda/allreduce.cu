@@ -2,9 +2,8 @@
 
 #if !defined(GGML_USE_MUSA)
 
+#include "ar-wire.cuh"
 #include "convert.cuh"
-#include "cpy-utils.cuh"
-#include "dequantize.cuh"
 #include "fwht.cuh"
 #include "ggml-impl.h"
 
@@ -231,133 +230,6 @@ static __global__ void ggml_cuda_ar_add_kernel(
     }
 }
 
-// Quantized-wire add kernel for the copy-engine path.  `dst` is a *rotated*
-// F32 accumulator (ne elements) and `src` is the peer's wire buffer of
-// nblocks = ne/QK block_t entries.  Each thread owns one wire block.
-//
-// For bit-equivalence between the two GPUs both sides round their *own*
-// rotated accumulator through the same wire before summing: the peer already
-// quantized and transmitted its rotated value (so we dequantize it back), and
-// we re-quantize the *local* rotated accumulator with the same block quantizer
-// and dequantize that too -- so both devices compute with identical per-element
-// wire values.  An inactive shard was zeroed up-front, so its rotated value is
-// exactly zero and re-quantizing it yields the same zero wire as the peer's --
-// keeping both sides bit-identical.  Since float addition is commutative, the
-// order in which the two rounded terms are summed never matters.
-//
-// The `pairwise` flag selects the on-wire layout convention, matching the
-// dequantize_* helpers in cpy.cu:
-//   * pairwise=false (Q4_0/Q5_0): dequant(ib, j) returns the two values stored
-//     in byte j of qs[] (elements j and j + QK/2 of the block).
-//   * pairwise=true  (Q8_0):       dequant(ib, 2*j) returns elements
-//     2*j and 2*j + 1 (int8 quants are contiguously indexed).
-template <typename block_t, int QK, bool pairwise,
-          void (*dequant)(const void *, int64_t, int, float2 &),
-          void (*quantize)(const float *, block_t *)>
-static __global__ void ggml_cuda_ar_add_q_kernel(
-        float            * __restrict__ dst,
-        const block_t    * __restrict__ src,
-        int               nblocks) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int nt  = gridDim.x * blockDim.x;
-    for (int b = tid; b < nblocks; b += nt) {
-        const int off = b * QK;
-        // Round the local (rotated) F32 accumulator through the same wire type
-        // the peer used, so both GPUs sum identical per-element wire values.
-        block_t local_q;
-        quantize(dst + off, &local_q);
-        float vals[QK];
-#pragma unroll
-        for (int j = 0; j < QK / 2; ++j) {
-            float2 v_peer;
-            dequant(src + b, 0, pairwise ? 2*j : j, v_peer);
-            float2 v_local;
-            dequant(&local_q, 0, pairwise ? 2*j : j, v_local);
-            if (pairwise) {
-                vals[2*j]     = v_peer.x + v_local.x;
-                vals[2*j + 1] = v_peer.y + v_local.y;
-            } else {
-                vals[j]         = v_peer.x + v_local.x;
-                vals[j + QK/2]  = v_peer.y + v_local.y;
-            }
-        }
-#pragma unroll
-        for (int j = 0; j < QK; ++j) {
-            dst[off + j] = vals[j];
-        }
-    }
-}
-
-// Quantize a rotated F32 buffer (ne elements) blockwise into the wire type.
-// One thread per block; reuses the block quantizers from cpy-utils.cuh.
-template <int QK, typename block_t, void (*quantize)(const float *, block_t *)>
-static __global__ void ggml_cuda_ar_quantize_kernel(
-        const float * __restrict__ src,
-        block_t     * __restrict__ dst,
-        int nblocks) {
-    const int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b < nblocks) {
-        quantize(src + (int64_t) b * QK, dst + b);
-    }
-}
-
-static void ggml_cuda_ar_quantize(
-        cudaStream_t stream, void * dst, const float * src, int64_t ne,
-        ggml_type wire_type) {
-    const int block_size = 256;
-    switch (wire_type) {
-        case GGML_TYPE_Q8_0: {
-            const int nblocks = (int) (ne / QK8_0);
-            const int n_blocks = (nblocks + block_size - 1) / block_size;
-            ggml_cuda_ar_quantize_kernel<QK8_0, block_q8_0, quantize_f32_q8_0_block>
-                <<<n_blocks, block_size, 0, stream>>>(
-                    src, static_cast<block_q8_0 *>(dst), nblocks);
-            CUDA_CHECK(cudaGetLastError());
-            break;
-        }
-        case GGML_TYPE_Q5_0: {
-            const int nblocks = (int) (ne / QK5_0);
-            const int n_blocks = (nblocks + block_size - 1) / block_size;
-            ggml_cuda_ar_quantize_kernel<QK5_0, block_q5_0, quantize_f32_q5_0_block>
-                <<<n_blocks, block_size, 0, stream>>>(
-                    src, static_cast<block_q5_0 *>(dst), nblocks);
-            CUDA_CHECK(cudaGetLastError());
-            break;
-        }
-        case GGML_TYPE_Q4_0: {
-            const int nblocks = (int) (ne / QK4_0);
-            const int n_blocks = (nblocks + block_size - 1) / block_size;
-            ggml_cuda_ar_quantize_kernel<QK4_0, block_q4_0, quantize_f32_q4_0_block>
-                <<<n_blocks, block_size, 0, stream>>>(
-                    src, static_cast<block_q4_0 *>(dst), nblocks);
-            CUDA_CHECK(cudaGetLastError());
-            break;
-        }
-        default:
-            GGML_ASSERT(false);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Wire-type selection for the copy-engine (quantizable) path.
-// ---------------------------------------------------------------------------
-
-// Pick the wire type for an F32 tensor of `nbytes` bytes on the copy-engine
-// path.  Returns the wire ggml_type and whether the wire is a quantized type.
-//
-// Ordering rationale (most -> least aggressive on-wire narrowing):
-//   F32  4 B/el  (baseline, no narrowing)
-//   BF16 2 B/el
-//   Q8_0 34/32 = 1.0625 B/el
-//   Q5_0 24/32 = 0.75 B/el
-//   Q4_0 18/32 = 0.5625 B/el
-// The threshold ladder is monotone in *necessity*: a user who sets a Q4_0
-// threshold also wants Q5_0 / Q8_0 / BF16 for smaller tensors.  So the most
-// aggressive enabled type whose threshold the tensor satisfies wins, in the
-// order Q4_0 -> Q5_0 -> Q8_0 -> BF16.  (Q4_0 winning over Q5_0 over Q8_0 is
-// intentional: for a given tensor that satisfies all three, the narrower wire
-// saves the most bandwidth, exactly what the quantized path is for.)
-// ---------------------------------------------------------------------------
 // Pipeline structure
 // ---------------------------------------------------------------------------
 
@@ -443,10 +315,7 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_bytes;   // bytes per device in host_large[] / dev_tmp[]
     size_t   copy_threshold;
     size_t   copy_chunk_bytes;
-    size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
-    size_t   q8_0_threshold; // tensors >= this size (bytes) are reduced via FP32->Q8_0 wire; 0 disables
-    size_t   q5_0_threshold; // tensors >= this size (bytes) are reduced via FP32->Q5_0 wire; 0 disables
-    size_t   q4_0_threshold; // tensors >= this size (bytes) are reduced via FP32->Q4_0 wire; 0 disables
+    ggml_cuda_ar_wire_config wire_cfg; // on-wire datatype thresholds (BF16 + quantized)
     uint64_t call_count;
 
     // Per-device resources.
@@ -476,48 +345,12 @@ struct ggml_cuda_ar_pipeline {
     ggml_cuda_ar_host_mapping arrival;
 };
 
-// Whether `ne` (element count of an F32 tensor) can go over a quantized
-// (rotated) wire: the rotation needs ne to be a multiple of a power of two in
-// {64, 128, 256, 512}.  Any other F32 tensor falls back to the BF16/F32 wire.
-static bool ggml_cuda_ar_quant_eligible(int64_t ne) {
-    return ggml_cuda_ar_fwht_n(ne) != 0;
-}
-
-// This helper is only meaningful when the copy-engine path is actually used
-// (quantized wires have no chunked-kernel path); the caller guards that.
-// Quantized wires additionally require the input to be F32 (the rotation +
-// block quantization machinery operates on F32 data) and `ne` to be rotatable
-// (see ggml_cuda_ar_quant_eligible); anything else skips straight to BF16.
-static ggml_type ggml_cuda_ar_pick_wire_type(
-        const ggml_cuda_ar_pipeline * p, bool use_copy_engine,
-        bool input_is_f32, int64_t ne, size_t nbytes) {
-    const bool quant_eligible = use_copy_engine && input_is_f32 && ggml_cuda_ar_quant_eligible(ne);
-    if (quant_eligible) {
-        if (p->q4_0_threshold > 0 && nbytes >= p->q4_0_threshold) return GGML_TYPE_Q4_0;
-        if (p->q5_0_threshold > 0 && nbytes >= p->q5_0_threshold) return GGML_TYPE_Q5_0;
-        if (p->q8_0_threshold > 0 && nbytes >= p->q8_0_threshold) return GGML_TYPE_Q8_0;
-    }
-    if (p->bf16_threshold > 0 && nbytes >= p->bf16_threshold) return GGML_TYPE_BF16;
-    return GGML_TYPE_F32;
-}
-
 // Base pointer for the (slot, rank) per-block token block.  The kernel adds
 // blockIdx.x * (ARRIVAL_STRIDE/sizeof(int)) internally to land on its own slot.
 static int * ggml_cuda_ar_arrival_ptr(const ggml_cuda_ar_pipeline * p, int slot, int rank) {
     const size_t offset = ((size_t)slot * p->n_devices + rank) *
                           GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
     return reinterpret_cast<int *>(p->arrival.dev + offset);
-}
-
-static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) {
-    const char * value = getenv(name);
-    if (value == nullptr || value[0] == '\0') {
-        return default_value;
-    }
-
-    char * end = nullptr;
-    const unsigned long long parsed = strtoull(value, &end, 10);
-    return end != value ? (uint64_t) parsed : default_value;
 }
 
 struct ggml_cuda_ar_slot_info {
@@ -585,33 +418,10 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                       __func__, p->copy_chunk_bytes, GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN);
         p->copy_chunk_bytes = GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN;
     }
-    // GGML_CUDA_AR_BF16_THRESHOLD: byte threshold on the F32 input tensor
-    // size at or above which the reduction is performed via an FP32->BF16
-    // round-trip (halving on-wire bytes).  Semantics:
-    //   0        = disabled; FP32 wire for all tensors (max. numerics).
-    //   N > 0    = BF16 wire only for F32 tensors with nbytes >= N; smaller
-    //              tensors keep the FP32 wire.
-    // Default 131072 (128 KiB): small (e.g. token-generation) reductions are
-    // latency-bound, so they keep the numerically safe FP32 wire, while large
-    // (e.g. prompt-processing) reductions are bandwidth-bound and benefit
-    // from halved on-wire bytes.  This mirrors the NCCL path's heuristic
-    // (FP32 for small tensors, BF16 for large).  Use 1 for BF16 everywhere,
-    // or a huge value (e.g. 2e9) for FP32 everywhere.
-    p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 131072);
-    // Quantized wire types.  These are byte thresholds on the F32 input
-    // tensor size, exactly like the BF16 threshold (0 = disabled, default).
-    // Unlike BF16 they only apply on the copy-engine path (the bandwidth-bound
-    // large-tensor path) and they reduce the on-wire bytes further by rotating
-    // the tensor through a Walsh-Hadamard transform first so quantization
-    // error is spread uniformly.  They form a ladder of decreasing on-wire
-    // width (hence increasing narrowness):
-    //   BF16 (2 B/el) < Q8_0 (34/32 = 1.0625 B/el) < Q5_0 (24/32) < Q4_0 (18/32)
-    // The most aggressive type whose threshold is satisfied wins, so the
-    // selection is: Q4_0 (if set and met) -> Q5_0 -> Q8_0 -> BF16 -> F32.
-    // See ggml_cuda_ar_pick_wire_type below.
-    p->q8_0_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_Q8_0_THRESHOLD", 0);
-    p->q5_0_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_Q5_0_THRESHOLD", 0);
-    p->q4_0_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_Q4_0_THRESHOLD", 0);
+    // On-wire datatype thresholds (BF16 round-trip + quantized wires).  The
+    // ladder lives in ggml_cuda_ar_pick_wire; quantized wires additionally
+    // apply only on the copy-engine path (bandwidth-bound large tensors).
+    p->wire_cfg         = ggml_cuda_ar_wire_config_get();
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -787,23 +597,6 @@ static void ggml_cuda_ar_launch_add(
     }
     ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, stream>>>(
         static_cast<T_dst *>(dst), static_cast<const T_src *>(src), (int) ne);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-template <typename block_t, int QK, bool pairwise,
-          void (*dequant)(const void *, int64_t, int, float2 &),
-          void (*quantize)(const float *, block_t *)>
-static void ggml_cuda_ar_launch_add_q(
-        cudaStream_t stream, void * dst, const void * src, int64_t ne) {
-    const int nblocks = (int) (ne / QK); // ne is a multiple of QK
-    const int block_size = 256;
-    int n_blocks = (nblocks + block_size - 1) / block_size;
-    if (n_blocks > 1024) {
-        n_blocks = 1024;
-    }
-    ggml_cuda_ar_add_q_kernel<block_t, QK, pairwise, dequant, quantize>
-        <<<n_blocks, block_size, 0, stream>>>(
-            static_cast<float *>(dst), static_cast<const block_t *>(src), nblocks);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1022,14 +815,8 @@ bool ggml_cuda_ar_allreduce(
         compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
     }
 
-    // Wire selection.  Unlike the reference approach (a single use_bf16 flag),
-    // we pick the wire type from an ordered ladder of narrowing wire types:
-    //   F32 -> BF16 -> Q8_0 -> Q5_0 -> Q4_0
-    // ordered by increasing on-wire narrowing (see ggml_cuda_ar_pick_wire_type
-    // for the exact byte-widths and rationale).  The original behaviour -- F32
-    // inputs >= bf16_threshold reduced over a BF16 wire -- is unchanged when
-    // all quant thresholds are 0 (the default): wire resolves to BF16 exactly
-    // when the old use_bf16 condition held, and to F32 otherwise.
+    // Wire selection: the shared threshold ladder in ggml_cuda_ar_pick_wire
+    // (F32 -> BF16 -> Q8_0 -> Q5_0 -> Q4_0, most-aggressive-that-is-met wins).
     const size_t f32_nbytes = input_nbytes;
 
     // The BF16 path works for both the chunked kernel and the copy-engine
@@ -1037,8 +824,8 @@ bool ggml_cuda_ar_allreduce(
     // copy-engine only; they are resolved once the engine choice is made.
     const bool use_bf16 =
         input_type == GGML_TYPE_F32 &&
-        p->bf16_threshold > 0 &&
-        f32_nbytes >= p->bf16_threshold;
+        p->wire_cfg.bf16_threshold > 0 &&
+        f32_nbytes >= p->wire_cfg.bf16_threshold;
     const ggml_type bf16_wire = use_bf16 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
 
     // Working type on the wire and its per-element byte size.  F16/BF16
@@ -1066,7 +853,7 @@ bool ggml_cuda_ar_allreduce(
     // this tensor.
     const ggml_type kernel_type =
         input_type != GGML_TYPE_F32 ? input_type :
-        use_copy_engine ? ggml_cuda_ar_pick_wire_type(p, use_copy_engine, input_type == GGML_TYPE_F32, ne, f32_nbytes) : bf16_wire;
+        use_copy_engine ? ggml_cuda_ar_pick_wire(p->wire_cfg, ggml_cuda_ar_quant_eligible(ne), f32_nbytes) : bf16_wire;
     const bool use_quant = use_copy_engine &&
         (kernel_type == GGML_TYPE_Q8_0 || kernel_type == GGML_TYPE_Q5_0 || kernel_type == GGML_TYPE_Q4_0);
 
@@ -1197,7 +984,7 @@ bool ggml_cuda_ar_allreduce(
                         ggml_cuda_ar_quantize(cuda_ctx->stream(), qn[i], rot_tmp[i].get(), ne, kernel_type);
                     }
                     ok = ggml_cuda_ar_allreduce_copy_outer_q<QK8_0, block_q8_0,
-                        ggml_cuda_ar_launch_add_q<block_q8_0, QK8_0, true,
+                        ggml_cuda_ar_add_q<block_q8_0, QK8_0, true,
                             dequantize_q8_0, quantize_f32_q8_0_block>>(
                         p, backends, qn, rot_dst, inner_compute, ne);
                     break;
@@ -1214,7 +1001,7 @@ bool ggml_cuda_ar_allreduce(
                         ggml_cuda_ar_quantize(cuda_ctx->stream(), qn[i], rot_tmp[i].get(), ne, kernel_type);
                     }
                     ok = ggml_cuda_ar_allreduce_copy_outer_q<QK5_0, block_q5_0,
-                        ggml_cuda_ar_launch_add_q<block_q5_0, QK5_0, false,
+                        ggml_cuda_ar_add_q<block_q5_0, QK5_0, false,
                             dequantize_q5_0, quantize_f32_q5_0_block>>(
                         p, backends, qn, rot_dst, inner_compute, ne);
                     break;
@@ -1231,7 +1018,7 @@ bool ggml_cuda_ar_allreduce(
                         ggml_cuda_ar_quantize(cuda_ctx->stream(), qn[i], rot_tmp[i].get(), ne, kernel_type);
                     }
                     ok = ggml_cuda_ar_allreduce_copy_outer_q<QK4_0, block_q4_0,
-                        ggml_cuda_ar_launch_add_q<block_q4_0, QK4_0, false,
+                        ggml_cuda_ar_add_q<block_q4_0, QK4_0, false,
                             dequantize_q4_0, quantize_f32_q4_0_block>>(
                         p, backends, qn, rot_dst, inner_compute, ne);
                     break;
