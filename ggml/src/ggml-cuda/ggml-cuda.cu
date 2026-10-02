@@ -986,52 +986,11 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
 //   * comp_done[2] -- compute-stream add/quant for a parity done; gates the
 //     next use of qn_a/rot_acc for that parity.
 
-// Sub-chunks per ring step for bidirectional D2H||H2D pipelining.  Sweet spot
-// measured on 8x M10 (9B Q4_1, -sm tensor, pp256, q8 ring): C=2 72.78 >
-// C=4 68.84 > C=1 54.95, while C=8 regresses to 26.70 (per-sub launch
-// overhead at small sub-chunks), so default to 2.  Effective C is the largest
-// value in [1..GGML_CUDA_AR_RING_SUBCHUNKS_MAX] that divides the chunk exactly
-// and keeps each sub-chunk wire-block aligned (falls back to 1 = monolithic).
-static constexpr int GGML_CUDA_AR_RING_SUBCHUNKS     = 2; // default subdivision
-static constexpr int GGML_CUDA_AR_RING_SUBCHUNKS_MAX = 8; // upper bound (event-array capacity)
-
-// Effective per-step sub-chunk count from the environment
-// (GGML_CUDA_AR_RING_SUBCHUNKS, default 2, clamped to [1, MAX]).  A caller can
-// set 1 to force the old monolithic single-copy behavior for A/B testing.
-static inline int ggml_cuda_ar_ring_subchunks(void) {
-    const uint64_t v = ggml_cuda_ar_env_u64("GGML_CUDA_AR_RING_SUBCHUNKS", GGML_CUDA_AR_RING_SUBCHUNKS);
-    int c = (int) v;
-    if (c < 1) { c = 1; }
-    if (c > GGML_CUDA_AR_RING_SUBCHUNKS_MAX) { c = GGML_CUDA_AR_RING_SUBCHUNKS_MAX; }
-    return c;
-}
-
-// Early add/quantize each ring sub-chunk as soon as its H2D lands, instead of
-// waiting for the whole chunk.  Default ON (per-sub-chunk launch so earlier
-// sub-chunks compute while later ones are still arriving); setting
-// GGML_CUDA_AR_RING_EARLY_ADD to an explicit off-string ("0","false","no",
-// "off", case-insensitive) reverts to the monolithic single-kernel-pair per
-// chunk, the historical behavior.  Purely a caller-side A/B performance knob:
-// the ring algebra, FWHT placement and blockwise add are unchanged, so results
-// remain bit-identical across ranks.
-static inline bool ggml_cuda_ar_ring_early_add(void) {
-    const char * v = getenv("GGML_CUDA_AR_RING_EARLY_ADD");
-    if (v == nullptr) {
-        // Absent -> default ON.
-        return true;
-    }
-    for (const char * off : { "0", "false", "no", "off" }) {
-        // Case-insensitive match -> OFF.  Any other present value -> ON.
-        bool off_match = true;
-        for (const char *a = v, *b = off; ; ++a, ++b) {
-            const char ca = (char) std::tolower((unsigned char) *a);
-            if (ca != *b) { off_match = false; break; }
-            if (*b == '\0') break;
-        }
-        if (off_match) return false;
-    }
-    return true;
-}
+// Sub-chunks per ring step for bidirectional D2H||H2D pipelining.  Effective C
+// is the largest value in [1..GGML_CUDA_AR_RING_SUBCHUNKS_MAX] that divides the
+// chunk exactly and keeps each sub-chunk wire-block aligned (falls back to
+// 1 = monolithic).
+static constexpr int GGML_CUDA_AR_RING_SUBCHUNKS_MAX = 8; // event-array capacity
 
 struct ggml_cuda_ar_ring_rank {
     // Parity double-buffered pinned host staging.  Step s uses host[s%2]; two
@@ -1275,20 +1234,6 @@ static bool ggml_backend_cuda_comm_allreduce_quant_butterfly(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
     const int64_t ne = ggml_nelements(tensors[0]);
     const size_t n  = comm_ctx->backends.size();
-    if (n < 1) {
-        return false;
-    }
-
-    // Only F32 inputs are rotatable + quantizable.
-    if (tensors[0]->type != GGML_TYPE_F32) {
-        return false;
-    }
-    if (ne == 0) {
-        return true;
-    }
-    if (!ggml_cuda_ar_quant_eligible(ne)) {
-        return false; // ne not rotatable -> BF16/F32 wire
-    }
 
     for (size_t i = 0; i < n; ++i) {
         GGML_ASSERT(tensors[i] != nullptr);
@@ -1300,9 +1245,6 @@ static bool ggml_backend_cuda_comm_allreduce_quant_butterfly(
     const ggml_cuda_ar_wire_config cfg = ggml_cuda_ar_wire_config_get();
     const size_t f32_nbytes = (size_t) ne * sizeof(float);
     const ggml_type wire = ggml_cuda_ar_pick_wire(cfg, true, f32_nbytes);
-    if (wire != GGML_TYPE_Q8_0 && wire != GGML_TYPE_Q5_0 && wire != GGML_TYPE_Q4_0) {
-        return false; // no quantized wire configured -> let the NCCL ring handle it
-    }
 
     const size_t wire_nbytes = ggml_cuda_ar_wire_nbytes(ne, wire);
     GGML_LOG_DEBUG("%s: quantized wire %s for %s (n=%zu, %" PRId64 " elems, %zu bytes -> %zu wire bytes)\n",
@@ -1559,25 +1501,18 @@ static bool ggml_backend_cuda_comm_allreduce_quant_butterfly(
 // N-GPU quantized all-reduce via a bandwidth-optimal RING.
 //
 // The butterfly above is all-to-all: every rank sends its full on-wire buffer
-// to each of its ~log2(N) partners, so it moves ~2N wire bytes per rank (N=8:
-// ~6x) even though the reduction is only a sum.  NCCL's fast BF16 path instead
-// uses a ring (reduce-scatter + all-gather), where each rank talks only to its
-// two ring neighbours and the data shuttles around, moving only ~2x its own
-// wire -- ~3x less traffic for N=8.  That is why the BF16 control beats the q8
-// butterfly on a bandwidth-bound prefill.
+// to each of its ~log2(N) partners.  A ring (reduce-scatter + all-gather)
+// instead has each rank talk only to its two ring neighbours and shuttles the
+// data around, moving ~2x its own wire regardless of rank count.
 //
 // This implements the same ring topology over a *quantized* (block-encoded)
-// wire using the shared quantize / q-add kernels.  Index algebra (verified
-// against a source-tracking simulation for N=4):
+// wire using the shared quantize / q-add kernels.  Index algebra:
 //   Reduce-scatter (N-1 steps, step s): rank sends slot (r-s) right, folds slot
 //     (r-s-1) from the left into the local accumulator, re-quantizes.  After
 //     N-1 steps slot (r+1) mod N holds the complete wire-rounded chunk.
 //   All-gather (N-1 steps): the completed chunks rotate around the ring
 //     (send slot (r-s+1) right, install slot (r-s) from the left, replace the
 //     target) until every rank holds all N chunks.
-//
-// Gated by GGML_CUDA_AR_QUANT_NO_RING (any value disables, falling back to
-// the butterfly); on by default.  See the dispatcher below.
 // ---------------------------------------------------------------------------
 static bool ggml_backend_cuda_comm_allreduce_quant_ring(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
@@ -1585,15 +1520,6 @@ static bool ggml_backend_cuda_comm_allreduce_quant_ring(
     const size_t n  = comm_ctx->backends.size();
     if (n < 2 || (n & (n - 1)) != 0) {
         return false; // ring needs a power-of-two rank count
-    }
-    if (tensors[0]->type != GGML_TYPE_F32) {
-        return false;
-    }
-    if (ne == 0) {
-        return true;
-    }
-    if (!ggml_cuda_ar_quant_eligible(ne)) {
-        return false;
     }
     if ((int64_t) n > ne || (ne % (int64_t) n) != 0 || ((ne / (int64_t) n) % QK8_0) != 0) {
         return false;
@@ -1609,9 +1535,6 @@ static bool ggml_backend_cuda_comm_allreduce_quant_ring(
     const ggml_cuda_ar_wire_config cfg = ggml_cuda_ar_wire_config_get();
     const size_t f32_nbytes = (size_t) ne * sizeof(float);
     const ggml_type wire = ggml_cuda_ar_pick_wire(cfg, true, f32_nbytes);
-    if (wire != GGML_TYPE_Q8_0 && wire != GGML_TYPE_Q5_0 && wire != GGML_TYPE_Q4_0) {
-        return false; // no quantized wire configured -> let the NCCL ring handle it
-    }
 
     const size_t wire_nbytes   = ggml_cuda_ar_wire_nbytes(ne, wire);
     const size_t chunk_elems   = (size_t) (ne / (int64_t) n);        // elems per chunk
@@ -1696,11 +1619,11 @@ static bool ggml_backend_cuda_comm_allreduce_quant_ring(
     const int64_t nn = (int64_t) n;
 
     // Per-step sub-chunk geometry.  chunk_wire is already exact per-rank wire
-    // (wire_nbytes / n).  Pick the largest C in [1..GGML_CUDA_AR_RING_SUBCHUNKS]
-    // (env-overridable) that divides chunk_wire exactly and keeps each
-    // sub-chunk wire-block aligned (sub_wire a multiple of the wire block
-    // size).  Falls back to 1 = monolithic single-copy (old behavior).
-    int    C = ggml_cuda_ar_ring_subchunks();
+    // (wire_nbytes / n).  Pick the largest C in [1..GGML_CUDA_AR_RING_SUBCHUNKS_MAX]
+    // that divides chunk_wire exactly and keeps each sub-chunk wire-block
+    // aligned (sub_wire a multiple of the wire block size).  Falls back to
+    // 1 = monolithic single-copy.
+    int    C = 2;
     size_t block_wire = 1;
     switch (wire) {
         case GGML_TYPE_Q8_0: block_wire = sizeof(block_q8_0); break;
@@ -1804,48 +1727,29 @@ static bool ggml_backend_cuda_comm_allreduce_quant_ring(
             }
         }
 
-        // -- Add + requantize on the compute stream.
-        // By default (GGML_CUDA_AR_RING_EARLY_ADD unset) each sub-chunk's
+        // -- Add + requantize on the compute stream.  Each sub-chunk's
         // add+quantize is launched as soon as that sub-chunk's H2D lands
         // (recv_h2d_done[p][c]), so earlier sub-chunks are computed while
-        // later ones are still arriving ("early add").  Setting
-        // GGML_CUDA_AR_RING_EARLY_ADD to a recognized off-string reverts to
-        // the monolithic path, where the compute add reads the whole
-        // freshly-pulled qn_rx slot, waits only on the LAST sub-chunk of the
-        // parity and does the whole chunk's add+quantize at once (one kernel
-        // pair per chunk).  The add_q and quantize kernels are blockwise
-        // independent (each QK-block touches only its own region), so the
-        // per-sub-chunk result is block-identical to the monolithic one and
-        // all ranks still converge bitwise-identically.  The FWHT and the rest
-        // of the ring algebra are unchanged in both modes.
+        // later ones are still arriving ("early add").  The add_q and quantize
+        // kernels are blockwise independent (each QK-block touches only its own
+        // region), so the per-sub-chunk result is block-identical to a
+        // monolithic chunk add.
         const size_t sub_elems = chunk_elems / (size_t) C; // elems per sub-chunk
         for (size_t r = 0; r < n; ++r) {
             ggml_cuda_ar_ring_rank & rk = ring->rank[r];
             auto * c_ctx = static_cast<ggml_backend_cuda_context *>(comm_ctx->backends[r]->context);
             ggml_cuda_set_device(c_ctx->device);
             const int64_t rc = stride((int64_t) r - s - 1);
-            if (ggml_cuda_ar_ring_early_add()) {
-                for (int c = 0; c < C; ++c) {
-                    CUDA_CHECK(cudaStreamWaitEvent(c_ctx->stream(), rk.recv_h2d_done[p][c], 0));
-                    ggml_cuda_ar_add_q_for_type(c_ctx->stream(),
-                                                rot_acc[r].get() + (size_t) rc * chunk_elems + (size_t) c * sub_elems,
-                                                qn_rx[r].get() + (size_t) rc * chunk_wire + (size_t) c * sub_wire,
-                                                sub_elems, wire);
-                    ggml_cuda_ar_quantize(c_ctx->stream(),
-                                          qn_a[r].get() + (size_t) rc * chunk_wire + (size_t) c * sub_wire,
-                                          rot_acc[r].get() + (size_t) rc * chunk_elems + (size_t) c * sub_elems,
-                                          sub_elems, wire);
-                }
-            } else {
-                CUDA_CHECK(cudaStreamWaitEvent(c_ctx->stream(), rk.recv_h2d_done[p][C - 1], 0));
+            for (int c = 0; c < C; ++c) {
+                CUDA_CHECK(cudaStreamWaitEvent(c_ctx->stream(), rk.recv_h2d_done[p][c], 0));
                 ggml_cuda_ar_add_q_for_type(c_ctx->stream(),
-                                            rot_acc[r].get() + (size_t) rc * chunk_elems,
-                                            qn_rx[r].get() + (size_t) rc * chunk_wire,
-                                            chunk_elems, wire);
+                                            rot_acc[r].get() + (size_t) rc * chunk_elems + (size_t) c * sub_elems,
+                                            qn_rx[r].get() + (size_t) rc * chunk_wire + (size_t) c * sub_wire,
+                                            sub_elems, wire);
                 ggml_cuda_ar_quantize(c_ctx->stream(),
-                                      qn_a[r].get() + (size_t) rc * chunk_wire,
-                                      rot_acc[r].get() + (size_t) rc * chunk_elems,
-                                      chunk_elems, wire);
+                                      qn_a[r].get() + (size_t) rc * chunk_wire + (size_t) c * sub_wire,
+                                      rot_acc[r].get() + (size_t) rc * chunk_elems + (size_t) c * sub_elems,
+                                      sub_elems, wire);
             }
             // The freshly computed qn_a slot is now safe for the next D2H.
             CUDA_CHECK(cudaEventRecord(rk.send_ready, c_ctx->stream()));
@@ -2033,17 +1937,15 @@ static bool ggml_backend_cuda_comm_allreduce_quant_ring(
 
     return true;
 }
-// Shared dispatch for the N-GPU quantized all-reduce.  Prefers the
+// Shared dispatch for the N-GPU quantized all-reduce.  Uses the
 // bandwidth-optimal ring when it is compatible (power-of-two ranks, chunk
-// block-aligned); set GGML_CUDA_AR_QUANT_NO_RING to use the all-to-all
-// butterfly instead.  Both honor the same wire thresholds, so either returns
-// false, letting the caller use the F32/BF16 path.
+// block-aligned), else the all-to-all butterfly.  Both honor the same wire
+// thresholds and return false when no quantized wire applies, letting the
+// caller use the F32/BF16 path.
 static bool ggml_backend_cuda_comm_allreduce_quant_dispatch(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    if (getenv("GGML_CUDA_AR_QUANT_NO_RING") == nullptr) {
-        if (ggml_backend_cuda_comm_allreduce_quant_ring(comm_ctx, tensors)) {
-            return true;
-        }
+    if (ggml_backend_cuda_comm_allreduce_quant_ring(comm_ctx, tensors)) {
+        return true;
     }
     return ggml_backend_cuda_comm_allreduce_quant_butterfly(comm_ctx, tensors);
 }
@@ -2090,13 +1992,16 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 
     // Large tensors: if a quantized wire (Q8_0/Q5_0/Q4_0) is enabled and this
     // F32 tensor is rotatable, route to the N-GPU quantized reducer (a
-    // bandwidth-optimal ring when compatible and enabled, else the butterfly) --
-    // NCCL cannot sum a block-quantized buffer on the ring (see
+    // bandwidth-optimal ring when compatible, else the butterfly) -- NCCL
+    // cannot sum a block-quantized buffer on the ring (see
     // allreduce_quant_butterfly).
-    if (tensors[0]->type == GGML_TYPE_F32 &&
-        ggml_cuda_ar_quant_eligible(ne) &&
-        ggml_backend_cuda_comm_allreduce_quant_dispatch(comm_ctx, tensors)) {
-        return true;
+    if (tensors[0]->type == GGML_TYPE_F32 && ggml_cuda_ar_quant_eligible(ne)) {
+        const ggml_cuda_ar_wire_config cfg = ggml_cuda_ar_wire_config_get();
+        const ggml_type wire = ggml_cuda_ar_pick_wire(cfg, true, (size_t) ne * sizeof(float));
+        if ((wire == GGML_TYPE_Q8_0 || wire == GGML_TYPE_Q5_0 || wire == GGML_TYPE_Q4_0) &&
+            ggml_backend_cuda_comm_allreduce_quant_dispatch(comm_ctx, tensors)) {
+            return true;
+        }
     }
 
     // For large tensors it's faster to compress them to BF16 for the reduction:
@@ -2228,10 +2133,10 @@ static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
 }
 
 // ---------------------------------------------------------------------------
-// Init -- chained nccl -> internal -> none.  Each step tries to bring up its
-// resource; on failure it warns and recurses into the next step.
+// Init -- chained nccl -> internal -> butterfly.  Each step tries to bring up
+// its resource; on failure it warns and recurses into the next step.
 // ---------------------------------------------------------------------------
-static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * ret) {
+static void ggml_backend_cuda_comm_init_butterfly(ggml_backend_cuda_comm_context * ret) {
     ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
     GGML_LOG_INFO("ggml_cuda_allreduce: using butterfly (meta-backend)\n");
 }
@@ -2248,7 +2153,7 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
     (void) cudaGetLastError();
     GGML_LOG_WARN("internal AllReduce init failed (n_devices != 2?); "
                   "falling back to meta-backend butterfly\n");
-    ggml_backend_cuda_comm_init_none(ret);
+    ggml_backend_cuda_comm_init_butterfly(ret);
 }
 
 static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
@@ -2301,9 +2206,10 @@ static bool ggml_backend_cuda_comm_devices_have_p2p(const std::vector<int> & dev
     return false;
 }
 
-// Top-level init.  GGML_CUDA_ALLREDUCE (nccl|internal|none) is the explicit
-// override and wins when set.  Otherwise, if the participating devices have no
-// P2P pair, use the in-tree reducer (internal for a 2-device group, butterfly
+// Top-level init.  GGML_CUDA_ALLREDUCE (nccl|internal|butterfly) is the
+// explicit override and wins when set ("none" is accepted as a deprecated
+// alias for "butterfly").  Otherwise, if the participating devices have no P2P
+// pair, use the in-tree reducer (internal for a 2-device group, butterfly
 // otherwise); with P2P, use NCCL on Linux and internal elsewhere.  The chain
 // in each init step handles any further fallback.
 static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
@@ -2327,17 +2233,17 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
             ggml_backend_cuda_comm_init_nccl(ret);
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
-        } else if (env_str == "none") {
-            ggml_backend_cuda_comm_init_none(ret);
+        } else if (env_str == "butterfly" || env_str == "none") { // "none" deprecated alias
+            ggml_backend_cuda_comm_init_butterfly(ret);
         } else {
             GGML_LOG_WARN("unknown GGML_CUDA_ALLREDUCE value: %s\n", env);
-            ggml_backend_cuda_comm_init_none(ret);
+            ggml_backend_cuda_comm_init_butterfly(ret);
         }
     } else if (!ggml_backend_cuda_comm_devices_have_p2p(ret->dev_ids)) {
         if (ret->dev_ids.size() == 2) {
             ggml_backend_cuda_comm_init_internal(ret);
         } else {
-            ggml_backend_cuda_comm_init_none(ret);
+            ggml_backend_cuda_comm_init_butterfly(ret);
         }
     } else {
         // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
