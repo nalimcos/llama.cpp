@@ -1273,7 +1273,8 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
 }
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
-    if (params.split_mode == LLAMA_SPLIT_MODE_LAYER_TENSOR && params.tensor_split != nullptr) {
+    if (params.split_mode == LLAMA_SPLIT_MODE_LAYER_TENSOR && params.tensor_split != nullptr &&
+        std::any_of(params.tensor_split, params.tensor_split + llama_max_devices(), [](float x) { return x != 0.0f; })) {
         throw std::runtime_error("tensor_split is not supported with LLAMA_SPLIT_MODE_LAYER_TENSOR");
     }
     if (params.tensor_split != nullptr) {

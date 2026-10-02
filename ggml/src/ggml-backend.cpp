@@ -21,48 +21,7 @@
 #include <string.h>
 #include <algorithm>
 #include <unordered_map>
-#include <chrono>
 #include <vector>
-
-// Optional scheduler copy-timing instrumentation, enabled by setting
-// GGML_SCHED_TIME_COPIES=1 in the environment. Silent and (near) zero-cost
-// when disabled: all timing is guarded by the SCHED_TIME_ENABLED check.
-struct ggml_sched_time_stats {
-    bool enabled;
-    std::chrono::duration<double> input_copy{0};
-    std::chrono::duration<double> xs_sync_src{0};
-    std::chrono::duration<double> xs_sync_dst{0};
-    std::chrono::duration<double> xs_copy{0};
-    std::chrono::duration<double> xs_async{0};
-    int64_t n_compute = 0;
-    int64_t n_input_copy = 0;
-    int64_t n_xs_fallback = 0;
-    int64_t n_xs_async = 0;
-
-    ggml_sched_time_stats() : enabled(getenv("GGML_SCHED_TIME_COPIES") != nullptr) {
-        if (enabled) {
-            atexit([] {
-                ggml_sched_time_stats & s = ggml_sched_time_stats::get();
-                fprintf(stderr, "[SCHED_TIME] computes=%lld input_copy=%lld (%.3f ms total, %.3f ms/compute) "
-                        "xs_fallback=%lld (sync_src %.3f, sync_dst %.3f, copy %.3f ms total; %.3f ms/compute) "
-                        "xs_async=%lld (%.3f ms total, %.3f ms/compute)\n",
-                        (long long)s.n_compute, (long long)s.n_input_copy,
-                        s.input_copy.count()*1e3, s.n_compute ? s.input_copy.count()*1e3/s.n_compute : 0.0,
-                        (long long)s.n_xs_fallback, s.xs_sync_src.count()*1e3, s.xs_sync_dst.count()*1e3, s.xs_copy.count()*1e3,
-                        s.n_compute ? (s.xs_sync_src+s.xs_sync_dst+s.xs_copy).count()*1e3/s.n_compute : 0.0,
-                        (long long)s.n_xs_async, s.xs_async.count()*1e3,
-                        s.n_compute ? s.xs_async.count()*1e3/s.n_compute : 0.0);
-            });
-        }
-    }
-
-    static ggml_sched_time_stats & get() {
-        static ggml_sched_time_stats inst;
-        return inst;
-    }
-};
-
-#define SCHED_TIME_ENABLED (ggml_sched_time_stats::get().enabled)
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1688,8 +1647,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
-    if (SCHED_TIME_ENABLED) ggml_sched_time_stats::get().n_compute++;
-
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1719,17 +1676,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                auto t0 = SCHED_TIME_ENABLED ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
-                if (SCHED_TIME_ENABLED) {
-                    ggml_sched_time_stats::get().input_copy += std::chrono::steady_clock::now() - t0;
-                    ggml_sched_time_stats::get().n_input_copy++;
-                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1830,28 +1782,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    auto ta0 = SCHED_TIME_ENABLED ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        auto t0 = SCHED_TIME_ENABLED ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         ggml_backend_synchronize(input_backend);
-                        auto t1 = SCHED_TIME_ENABLED ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
-                        auto t2 = SCHED_TIME_ENABLED ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         ggml_backend_tensor_copy(input, input_cpy);
-                        if (SCHED_TIME_ENABLED) {
-                            auto t3 = std::chrono::steady_clock::now();
-                            ggml_sched_time_stats::get().xs_sync_src += t1 - t0;
-                            ggml_sched_time_stats::get().xs_sync_dst += t2 - t1;
-                            ggml_sched_time_stats::get().xs_copy    += t3 - t2;
-                            ggml_sched_time_stats::get().n_xs_fallback++;
-                        }
-                    } else if (SCHED_TIME_ENABLED) {
-                        ggml_sched_time_stats::get().xs_async += std::chrono::steady_clock::now() - ta0;
-                        ggml_sched_time_stats::get().n_xs_async++;
                     }
                 }
             }
