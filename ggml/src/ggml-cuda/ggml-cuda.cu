@@ -1894,7 +1894,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     }
 
     // cc 5.x (Maxwell): token-chunked fused MMVQ MoE path, no stream sync
-    if (ggml_cuda_should_use_mmvq_moe_chunk(src0->type, cc, dst->ne[2], dst->ne[0])) {
+    if (ggml_cuda_should_use_mmvq_moe_chunk(src0->type, cc, dst->ne[2], src0->ne[0])) {
         return false;
     }
 
