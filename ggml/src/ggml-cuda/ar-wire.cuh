@@ -209,7 +209,7 @@ template <typename block_t, int QK, bool pairwise,
           void (*dequant)(const void *, int64_t, int, float2 &),
           void (*quantize)(const float *, block_t *)>
 static inline void ggml_cuda_ar_add_q(
-        cudaStream_t stream, float * dst, const void * src, int64_t ne) {
+        cudaStream_t stream, void * dst, const void * src, int64_t ne) {
     const int nblocks = (int)(ne / QK); // ne is a multiple of QK
     const int block_size = 256;
     int n_blocks = (nblocks + block_size - 1) / block_size;
@@ -218,7 +218,7 @@ static inline void ggml_cuda_ar_add_q(
     }
     ggml_cuda_ar_add_q_kernel<block_t, QK, pairwise, dequant, quantize>
         <<<n_blocks, block_size, 0, stream>>>(
-            dst, static_cast<const block_t *>(src), nblocks);
+            static_cast<float *>(dst), static_cast<const block_t *>(src), nblocks);
     CUDA_CHECK(cudaGetLastError());
 }
 
