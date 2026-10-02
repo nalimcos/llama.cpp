@@ -10,6 +10,9 @@
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
+// Whether a MUL_MAT_ID of this type/batch should take the cc 5.x fused MMVQ MoE chunk path.
+bool ggml_cuda_should_use_mmvq_moe_chunk(enum ggml_type type, int cc, int64_t ne2, int64_t ne00);
+
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
