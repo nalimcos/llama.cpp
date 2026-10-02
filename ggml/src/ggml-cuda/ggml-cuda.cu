@@ -1642,8 +1642,6 @@ static bool ggml_backend_cuda_comm_allreduce_quant_ring(
                    chunk_wire, C, sub_wire, block_wire);
 
     // ------------------------------------------------------------------
-
-    // ------------------------------------------------------------------
     // Reduce-scatter (N-1 steps, step s): each rank sends slot (r-s) right and
     // folds slot (r-s-1) from the left.  D2H sends run on each rank's d2h_stream,
     // H2D pulls on its h2d_stream (so a rank's two directions overlap);
