@@ -5,11 +5,16 @@
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
-// GGML_CUDA_DEQ_WIDE (launch-config knob, results bitwise identical both ways):
-// packs multiple independent super-block jobs per CUDA block for the quant -> f32/f16
-// dequant kernels used e.g. by the cuBLAS MUL_MAT fallback.  The legacy launch
-// computes 2 elements per thread; the wide launch computes 4 (two independent
-// dequantize calls), halving the block count and doubling per-thread ILP.
+// GGML_CUDA_DEQ_WIDE (launch-config knob, results bitwise identical both ways)
+// gates two prefill-dequant mechanisms for the quant -> f32/f16 kernels used
+// e.g. by the cuBLAS MUL_MAT fallback:
+//   * wide per-thread variants (dequantize_block_wide) compute 4 elements per
+//     thread via two independent dequantize calls instead of 2, doubling ILP;
+//   * packed multi-superblock launches (launch_packed / dequantize_block_packed)
+//     place S independent QK_K super-block jobs in one CUDA block, and for the
+//     coalesced-store (_co) helpers transpose the thread->element mapping so
+//     each warp stores contiguously (thread lane writes elements lane, lane+32,
+//     ...).
 // Per-thread lane math and all arithmetic are unchanged: every output element
 // is computed exactly once by the same dequantize_<t> helper with the same
 // expression sequence, so outputs are bitwise identical to the legacy launch.
@@ -110,6 +115,21 @@ static __global__ void dequantize_block_packed(const void * __restrict__ vx, dst
         return;
     }
     F(vx, i, yy + i*QK_K, threadIdx.x % TPB);
+}
+
+// The coalesced-store (_co) helpers dequantize one QK_K super-block with exactly
+// one warp: lane/8 selects the 8-element group and lane%8 the element.  That
+// fixes TPB == 32 and lets a packed launch place DEQ_CO_S super-blocks in one
+// CUDA block.
+constexpr int DEQ_CO_TPB = 32;
+constexpr int DEQ_CO_S   = 8;
+static_assert(DEQ_CO_TPB == 32, "coalesced-store _co helpers assume a 32-lane layout");
+
+// Launch dequantize_block_packed with TPB threads per super-block job and S jobs
+// per CUDA block; the grid covers the super-block groups.
+template<typename dst_t, int TPB, int S, void (*F)(const void *, int64_t, dst_t *, int)>
+static void launch_packed(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t nb, cudaStream_t stream) {
+    dequantize_block_packed<dst_t, TPB, S, F><<<(nb + S - 1)/S, TPB*S, 0, stream>>>(vx, y, nb);
 }
 
 template <bool need_check>
@@ -352,8 +372,7 @@ template<typename dst_t>
 static void dequantize_row_q2_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     if (ggml_cuda_deq_wide_enabled()) {
-        constexpr int S = 4;
-        dequantize_block_packed<dst_t, 64, S, &dequantize_q2_K<dst_t>><<<(nb + S - 1)/S, 64*S, 0, stream>>>(vx, y, nb);
+        launch_packed<dst_t, 64, 4, &dequantize_q2_K<dst_t>>(vx, y, nb, stream);
         return;
     }
     dequantize_block_q2_K<<<nb, 64, 0, stream>>>(vx, y);
@@ -383,8 +402,7 @@ template<typename dst_t>
 static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     if (ggml_cuda_deq_wide_enabled()) {
-        constexpr int S = 8;
-        dequantize_block_packed<dst_t, 32, S, &dequantize_q4_K_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        launch_packed<dst_t, DEQ_CO_TPB, DEQ_CO_S, &dequantize_q4_K_co<dst_t>>(vx, y, nb, stream);
         return;
     }
     dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
@@ -394,7 +412,7 @@ template<typename dst_t>
 static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     if (ggml_cuda_deq_wide_enabled()) {
-        dequantize_block_packed<dst_t, 64, 2, &dequantize_q5_K<dst_t>><<<(nb + 1)/2, 128, 0, stream>>>(vx, y, nb);
+        launch_packed<dst_t, 64, 2, &dequantize_q5_K<dst_t>>(vx, y, nb, stream);
         return;
     }
     dequantize_block_q5_K<<<nb, 64, 0, stream>>>(vx, y);
@@ -404,8 +422,7 @@ template<typename dst_t>
 static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     if (ggml_cuda_deq_wide_enabled()) {
-        constexpr int S = 4;
-        dequantize_block_packed<dst_t, 64, S, &dequantize_q6_K<dst_t>><<<(nb + S - 1)/S, 64*S, 0, stream>>>(vx, y, nb);
+        launch_packed<dst_t, 64, 4, &dequantize_q6_K<dst_t>>(vx, y, nb, stream);
         return;
     }
     dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
@@ -415,8 +432,7 @@ template<typename dst_t>
 static void dequantize_row_iq2_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     if (ggml_cuda_deq_wide_enabled()) {
-        constexpr int S = 8;
-        dequantize_block_packed<dst_t, 32, S, &dequantize_iq2_xxs_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        launch_packed<dst_t, DEQ_CO_TPB, DEQ_CO_S, &dequantize_iq2_xxs_co<dst_t>>(vx, y, nb, stream);
         return;
     }
     dequantize_block_iq2_xxs<<<nb, 32, 0, stream>>>(vx, y);
@@ -426,8 +442,7 @@ template<typename dst_t>
 static void dequantize_row_iq2_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     if (ggml_cuda_deq_wide_enabled()) {
-        constexpr int S = 8;
-        dequantize_block_packed<dst_t, 32, S, &dequantize_iq2_xs_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        launch_packed<dst_t, DEQ_CO_TPB, DEQ_CO_S, &dequantize_iq2_xs_co<dst_t>>(vx, y, nb, stream);
         return;
     }
     dequantize_block_iq2_xs<<<nb, 32, 0, stream>>>(vx, y);
@@ -437,8 +452,7 @@ template<typename dst_t>
 static void dequantize_row_iq2_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     if (ggml_cuda_deq_wide_enabled()) {
-        constexpr int S = 8;
-        dequantize_block_packed<dst_t, 32, S, &dequantize_iq2_s_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        launch_packed<dst_t, DEQ_CO_TPB, DEQ_CO_S, &dequantize_iq2_s_co<dst_t>>(vx, y, nb, stream);
         return;
     }
     dequantize_block_iq2_s<<<nb, 32, 0, stream>>>(vx, y);
@@ -448,8 +462,7 @@ template<typename dst_t>
 static void dequantize_row_iq3_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     if (ggml_cuda_deq_wide_enabled()) {
-        constexpr int S = 8;
-        dequantize_block_packed<dst_t, 32, S, &dequantize_iq3_xxs_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        launch_packed<dst_t, DEQ_CO_TPB, DEQ_CO_S, &dequantize_iq3_xxs_co<dst_t>>(vx, y, nb, stream);
         return;
     }
     dequantize_block_iq3_xxs<<<nb, 32, 0, stream>>>(vx, y);
@@ -459,8 +472,7 @@ template<typename dst_t>
 static void dequantize_row_iq3_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     if (ggml_cuda_deq_wide_enabled()) {
-        constexpr int S = 8;
-        dequantize_block_packed<dst_t, 32, S, &dequantize_iq3_s_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        launch_packed<dst_t, DEQ_CO_TPB, DEQ_CO_S, &dequantize_iq3_s_co<dst_t>>(vx, y, nb, stream);
         return;
     }
     dequantize_block_iq3_s<<<nb, 32, 0, stream>>>(vx, y);
@@ -488,8 +500,7 @@ template<typename dst_t>
 static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
     if (ggml_cuda_deq_wide_enabled()) {
-        constexpr int S = 8;
-        dequantize_block_packed<dst_t, 32, S, &dequantize_iq4_xs_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        launch_packed<dst_t, DEQ_CO_TPB, DEQ_CO_S, &dequantize_iq4_xs_co<dst_t>>(vx, y, nb, stream);
         return;
     }
     dequantize_block_iq4_xs<<<nb, 32, 0, stream>>>(vx, y);
