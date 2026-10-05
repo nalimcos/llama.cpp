@@ -1502,10 +1502,11 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
 
-    // MTP draft graphs require hidden-state inputs that a token-only probe decode cannot
-    // provide; the draft context also has no memory module of its own. skip the probe.
+    // MTP draft graphs need hidden-state inputs that a token-only probe decode cannot
+    // provide, so skip the probe. The draft memory is a plain attention KV cache that
+    // supports partial seq_rm.
     if (llama_get_ctx_type(ctx) == LLAMA_CONTEXT_TYPE_MTP) {
-        return COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+        return COMMON_CONTEXT_SEQ_RM_TYPE_PART;
     }
 
     if (llama_n_rs_seq(ctx) > 0) {

@@ -625,6 +625,12 @@ struct server_slot {
                 "   graphs reused = %10d\n",
                 llama_perf_context(ctx_tgt).n_reused);
 
+        if (ctx_dft) {
+            SLT_INF(*this,
+                    "draft graphs reused = %10d\n",
+                    llama_perf_context(ctx_dft).n_reused);
+        }
+
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;
         const int32_t n_draft_verif_steps = stats.n_draft_verif_steps;

@@ -1504,6 +1504,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // unmasked nextn rows are dense and contiguous
+        const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             batch.clear();
@@ -1514,8 +1517,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-
             for (int k = 0; k < n_tokens; ++k) {
                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
@@ -1569,10 +1570,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
-            }
+            std::memcpy(verify_h[seq_id].data(),
+                        h_tgt + (size_t) i_batch_beg[seq_id] * n_embd,
+                        (size_t) n_rows * row_bytes);
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
