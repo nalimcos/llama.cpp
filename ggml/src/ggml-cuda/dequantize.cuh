@@ -211,6 +211,36 @@ static __device__ __forceinline__ void dequantize_q4_K(const void * vx, const in
     }
 }
 
+// coalesced-store variant: lane `l` writes elements l, l+32, ..., l+224
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_q4_K_co(const void * vx, const int64_t ibs, dst_t * yy, const int lane) {
+    const block_q4_K * x = (const block_q4_K *) vx;
+
+    const int64_t ir = lane/4; // 0...7
+    const int64_t l  = lane%4; // 0...3
+    dst_t * y = yy + lane;
+
+    const float dall = __low2half(x[ibs].dm);
+    const float dmin = __high2half(x[ibs].dm);
+
+    for (int64_t k = 0; k < 8; ++k) {
+        const int64_t il = k/2;
+        const int64_t is = 2*il;
+        const uint8_t * q = x[ibs].qs + 32*il + 4*ir;
+
+        uint8_t sc, m;
+        if (k % 2 == 0) {
+            get_scale_min_k4(is + 0, x[ibs].scales, sc, m);
+            const float d1 = dall * sc; const float m1 = dmin * m;
+            y[32*k] = ggml_cuda_cast<dst_t>(d1 * (q[l] & 0xF) - m1);
+        } else {
+            get_scale_min_k4(is + 1, x[ibs].scales, sc, m);
+            const float d2 = dall * sc; const float m2 = dmin * m;
+            y[32*k] = ggml_cuda_cast<dst_t>(d2 * (q[l] >>  4) - m2);
+        }
+    }
+}
+
 template<typename dst_t>
 static __device__ __forceinline__ void dequantize_q5_K(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
     const block_q5_K * x = (const block_q5_K *) vx;
@@ -362,6 +392,107 @@ static __device__ __forceinline__ void dequantize_iq3_s(const void * vx, const i
     }
 }
 
+//================================== i-quants, coalesced-store variants
+// Per-element arithmetic is identical to the dequantize_iq* helpers above; only
+// the thread->element mapping is transposed.  Instead of tid = 8*il + ib writing
+// 8 consecutive elements at yy + 32*ib + 8*il (a stride-32 scatter across the
+// warp), lane `l` writes elements l, l+32, ..., l+224, so each warp store is
+// fully coalesced.  These variants are used only by the dequantize_block_packed
+// kernels in convert.cu; the originals keep their layout for the get_rows path.
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_iq2_xxs_co(const void * vx, const int64_t ibs, dst_t * yy, const int lane) {
+    const block_iq2_xxs * x = (const block_iq2_xxs *) vx;
+
+    const int64_t il = lane/8; // 0...3
+    const int64_t j  = lane%8; // 0...7
+    dst_t * y = yy + lane;
+    for (int64_t ib = 0; ib < 8; ++ib) {
+        const uint16_t * q2 = x[ibs].qs + 4*ib;
+        const uint8_t  * aux8 = (const uint8_t *)q2;
+        const uint8_t  * grid = (const uint8_t *)(iq2xxs_grid + aux8[il]);
+        const uint32_t aux32 = q2[2] | (q2[3] << 16);
+        const float d = (float)x[ibs].d * (0.5f + (aux32 >> 28)) * 0.25f;
+        const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*il) & 127];
+        y[32*ib] = ggml_cuda_cast<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+    }
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_iq2_xs_co(const void * vx, const int64_t ibs, dst_t * yy, const int lane) {
+    const block_iq2_xs * x = (const block_iq2_xs *) vx;
+
+    const int64_t il = lane/8; // 0...3
+    const int64_t j  = lane%8; // 0...7
+    dst_t * y = yy + lane;
+    for (int64_t ib = 0; ib < 8; ++ib) {
+        const uint16_t * q2 = x[ibs].qs + 4*ib;
+        const uint8_t  * grid = (const uint8_t *)(iq2xs_grid + (q2[il] & 511));
+        const float d = (float)x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4*(il/2)) & 0xf)) * 0.25f;
+        const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
+        y[32*ib] = ggml_cuda_cast<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+    }
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_iq2_s_co(const void * vx, const int64_t ibs, dst_t * yy, const int lane) {
+    const block_iq2_s * x = (const block_iq2_s *) vx;
+
+    const int64_t il = lane/8; // 0...3
+    const int64_t j  = lane%8; // 0...7
+    dst_t * y = yy + lane;
+    for (int64_t ib = 0; ib < 8; ++ib) {
+        const uint8_t * grid = (const uint8_t *)(iq2s_grid + (x[ibs].qs[4*ib+il] | ((x[ibs].qh[ib] << (8-2*il)) & 0x300)));
+        const float d = (float)x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4*(il/2)) & 0xf)) * 0.25f;
+        const uint8_t signs = x[ibs].qs[QK_K/8+4*ib+il];
+        y[32*ib] = ggml_cuda_cast<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+    }
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_iq3_xxs_co(const void * vx, const int64_t ibs, dst_t * yy, const int lane) {
+    const block_iq3_xxs * x = (const block_iq3_xxs *) vx;
+
+    const int64_t il = lane/8; // 0...3
+    const int64_t j  = lane%8; // 0...7
+    dst_t * y = yy + lane;
+    for (int64_t ib = 0; ib < 8; ++ib) {
+        const uint8_t  * q3 = x[ibs].qs + 8*ib;
+        const uint16_t * gas = (const uint16_t *)(x[ibs].qs + QK_K/4) + 2*ib;
+        const uint8_t  * grid1 = (const uint8_t *)(iq3xxs_grid + q3[2*il+0]);
+        const uint8_t  * grid2 = (const uint8_t *)(iq3xxs_grid + q3[2*il+1]);
+        const uint32_t aux32 = gas[0] | (gas[1] << 16);
+        const float d = (float)x[ibs].d * (0.5f + (aux32 >> 28)) * 0.5f;
+        const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*il) & 127];
+        if (j < 4) {
+            y[32*ib] = ggml_cuda_cast<dst_t>(d * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f));
+        } else {
+            y[32*ib] = ggml_cuda_cast<dst_t>(d * grid2[j-4] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+        }
+    }
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_iq3_s_co(const void * vx, const int64_t ibs, dst_t * yy, const int lane) {
+    const block_iq3_s * x = (const block_iq3_s *) vx;
+
+    const int64_t il = lane/8; // 0...3
+    const int64_t j  = lane%8; // 0...7
+    dst_t * y = yy + lane;
+    for (int64_t ib = 0; ib < 8; ++ib) {
+        const uint8_t * qs = x[ibs].qs + 8*ib;
+        const uint8_t * grid1 = (const uint8_t *)(iq3s_grid + (qs[2*il+0] | ((x[ibs].qh[ib] << (8-2*il)) & 256)));
+        const uint8_t * grid2 = (const uint8_t *)(iq3s_grid + (qs[2*il+1] | ((x[ibs].qh[ib] << (7-2*il)) & 256)));
+        const float d = (float)x[ibs].d * (1 + 2*((x[ibs].scales[ib/2] >> 4*(ib%2)) & 0xf));
+        const uint8_t signs = x[ibs].signs[4*ib + il];
+        if (j < 4) {
+            y[32*ib] = ggml_cuda_cast<dst_t>(d * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f));
+        } else {
+            y[32*ib] = ggml_cuda_cast<dst_t>(d * grid2[j-4] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+        }
+    }
+}
+
 template<typename dst_t>
 static __device__ __forceinline__ void dequantize_iq1_s(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
 
@@ -432,6 +563,23 @@ static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const 
     for (int j = 0; j < 4; ++j) {
         y[j+ 0] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] >>  4]);
+    }
+}
+
+// coalesced-store variant: lane `l` writes elements l, l+32, ..., l+224
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_iq4_xs_co(const void * vx, const int64_t ibs, dst_t * yy, const int lane) {
+    const block_iq4_xs * x = (const block_iq4_xs *)vx;
+
+    const bool    hi = lane >= 16;
+    const int64_t il = hi ? (lane-16)/4 : lane/4; // 0...3
+    const int64_t j  = hi ? (lane-16)%4 : lane%4; // 0...3
+    dst_t * y = yy + lane;
+    for (int64_t ib = 0; ib < 8; ++ib) {
+        const uint8_t * q4 = x[ibs].qs + 16*ib + 4*il;
+        const float d = (float)x[ibs].d * ((((x[ibs].scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x[ibs].scales_h >> 2*ib) & 3) << 4)) - 32);
+        y[32*ib] = hi ? ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] >>  4])
+                      : ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
     }
 }
 

@@ -99,13 +99,13 @@ static __global__ void dequantize_block_wide(const void * __restrict__ vx, dst_t
     }
 }
 
-// wide: 2 independent super-block jobs per CUDA block, calling the same per-thread
+// wide: S independent super-block jobs per CUDA block, calling the same per-thread
 // dequantize helper (which assumes TPB threads per job) -> per-element arithmetic and
-// helper lane math unchanged, outputs bitwise identical; doubles block width for
-// occupancy (pre-Pascal max 32 blocks/SM)
-template<typename dst_t, int TPB, void (*F)(const void *, int64_t, dst_t *, int)>
+// helper lane math unchanged, outputs bitwise identical; widens the block for
+// occupancy (pre-Pascal max 32 blocks/SM caps 32-thread blocks at 50% occupancy)
+template<typename dst_t, int TPB, int S, void (*F)(const void *, int64_t, dst_t *, int)>
 static __global__ void dequantize_block_packed(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb) {
-    const int64_t i = 2*int64_t(blockIdx.x) + threadIdx.x/TPB; // blockDim.x == 2*TPB
+    const int64_t i = S*int64_t(blockIdx.x) + threadIdx.x/TPB; // blockDim.x == S*TPB
     if (i >= nb) {
         return;
     }
@@ -351,6 +351,11 @@ static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * 
 template<typename dst_t>
 static void dequantize_row_q2_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (ggml_cuda_deq_wide_enabled()) {
+        constexpr int S = 4;
+        dequantize_block_packed<dst_t, 64, S, &dequantize_q2_K<dst_t>><<<(nb + S - 1)/S, 64*S, 0, stream>>>(vx, y, nb);
+        return;
+    }
     dequantize_block_q2_K<<<nb, 64, 0, stream>>>(vx, y);
 }
 
@@ -377,6 +382,11 @@ static void dequantize_row_q4_1_cuda(const void * vx, dst_t * y, const int64_t k
 template<typename dst_t>
 static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (ggml_cuda_deq_wide_enabled()) {
+        constexpr int S = 8;
+        dequantize_block_packed<dst_t, 32, S, &dequantize_q4_K_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        return;
+    }
     dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
 }
 
@@ -384,7 +394,7 @@ template<typename dst_t>
 static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     if (ggml_cuda_deq_wide_enabled()) {
-        dequantize_block_packed<dst_t, 64, &dequantize_q5_K<dst_t>><<<(nb + 1)/2, 128, 0, stream>>>(vx, y, nb);
+        dequantize_block_packed<dst_t, 64, 2, &dequantize_q5_K<dst_t>><<<(nb + 1)/2, 128, 0, stream>>>(vx, y, nb);
         return;
     }
     dequantize_block_q5_K<<<nb, 64, 0, stream>>>(vx, y);
@@ -393,36 +403,66 @@ static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k
 template<typename dst_t>
 static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (ggml_cuda_deq_wide_enabled()) {
+        constexpr int S = 4;
+        dequantize_block_packed<dst_t, 64, S, &dequantize_q6_K<dst_t>><<<(nb + S - 1)/S, 64*S, 0, stream>>>(vx, y, nb);
+        return;
+    }
     dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq2_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (ggml_cuda_deq_wide_enabled()) {
+        constexpr int S = 8;
+        dequantize_block_packed<dst_t, 32, S, &dequantize_iq2_xxs_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        return;
+    }
     dequantize_block_iq2_xxs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq2_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (ggml_cuda_deq_wide_enabled()) {
+        constexpr int S = 8;
+        dequantize_block_packed<dst_t, 32, S, &dequantize_iq2_xs_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        return;
+    }
     dequantize_block_iq2_xs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq2_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (ggml_cuda_deq_wide_enabled()) {
+        constexpr int S = 8;
+        dequantize_block_packed<dst_t, 32, S, &dequantize_iq2_s_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        return;
+    }
     dequantize_block_iq2_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq3_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (ggml_cuda_deq_wide_enabled()) {
+        constexpr int S = 8;
+        dequantize_block_packed<dst_t, 32, S, &dequantize_iq3_xxs_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        return;
+    }
     dequantize_block_iq3_xxs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq3_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (ggml_cuda_deq_wide_enabled()) {
+        constexpr int S = 8;
+        dequantize_block_packed<dst_t, 32, S, &dequantize_iq3_s_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        return;
+    }
     dequantize_block_iq3_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
@@ -447,6 +487,11 @@ static void dequantize_row_iq1_m_cuda(const void * vx, dst_t * y, const int64_t 
 template<typename dst_t>
 static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
+    if (ggml_cuda_deq_wide_enabled()) {
+        constexpr int S = 8;
+        dequantize_block_packed<dst_t, 32, S, &dequantize_iq4_xs_co<dst_t>><<<(nb + S - 1)/S, 32*S, 0, stream>>>(vx, y, nb);
+        return;
+    }
     dequantize_block_iq4_xs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
