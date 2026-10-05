@@ -390,9 +390,8 @@ static __device__ __forceinline__ void dequantize_iq3_xxs(const void * vx, const
     const uint32_t aux32 = gas[0] | (gas[1] << 16);
     const float d = (float)x[ibs].d * (0.5f + (aux32 >> 28)) * 0.5f;
     const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*il) & 127];
-    for (int j = 0; j < 4; ++j) {
-        y[j+0] = iq3_dual_grid_value<dst_t>(d, grid1, grid2, signs, j+0);
-        y[j+4] = iq3_dual_grid_value<dst_t>(d, grid1, grid2, signs, j+4);
+    for (int e = 0; e < 8; ++e) {
+        y[e] = iq3_dual_grid_value<dst_t>(d, grid1, grid2, signs, e);
     }
 }
 
@@ -409,9 +408,8 @@ static __device__ __forceinline__ void dequantize_iq3_s(const void * vx, const i
     const uint8_t * grid2 = (const uint8_t *)(iq3s_grid + (qs[2*il+1] | ((x[ibs].qh[ib] << (7-2*il)) & 256)));
     const float d = (float)x[ibs].d * (1 + 2*((x[ibs].scales[ib/2] >> 4*(ib%2)) & 0xf));
     const uint8_t signs = x[ibs].signs[4*ib + il];
-    for (int j = 0; j < 4; ++j) {
-        y[j+0] = iq3_dual_grid_value<dst_t>(d, grid1, grid2, signs, j+0);
-        y[j+4] = iq3_dual_grid_value<dst_t>(d, grid1, grid2, signs, j+4);
+    for (int e = 0; e < 8; ++e) {
+        y[e] = iq3_dual_grid_value<dst_t>(d, grid1, grid2, signs, e);
     }
 }
 

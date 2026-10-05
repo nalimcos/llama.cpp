@@ -117,13 +117,10 @@ static __global__ void dequantize_block_packed(const void * __restrict__ vx, dst
     F(vx, i, yy + i*QK_K, threadIdx.x % TPB);
 }
 
-// The coalesced-store (_co) helpers dequantize one QK_K super-block with exactly
-// one warp: lane/8 selects the 8-element group and lane%8 the element.  That
-// fixes TPB == 32 and lets a packed launch place DEQ_CO_S super-blocks in one
-// CUDA block.
+// Coalesced-store (_co) helpers dequantize one QK_K super-block with a single
+// warp; DEQ_CO_S such super-blocks share a CUDA block.
 constexpr int DEQ_CO_TPB = 32;
 constexpr int DEQ_CO_S   = 8;
-static_assert(DEQ_CO_TPB == 32, "coalesced-store _co helpers assume a 32-lane layout");
 
 // Launch dequantize_block_packed with TPB threads per super-block job and S jobs
 // per CUDA block; the grid covers the super-block groups.
